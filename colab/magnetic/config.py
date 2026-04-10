@@ -28,7 +28,7 @@ class MagneticConfig:
     # +/- 2 with weight 1.0 for abs(d)==1 and 0.5 for abs(d)==2, then
     # multiplied by 0.1. Keeping the same defaults.
     edge_window: int = 2
-    edge_weight_schedule: tuple = (1.0, 0.5)  # weights at distance 1, 2, ...
+    edge_weight_schedule: tuple = (1.0, 0.5, 0.25, 0.12, 0.06)  # at dist 1..5
     edge_base_amount: float = 0.1
 
     # Threshold below which an edge is ignored during physics and

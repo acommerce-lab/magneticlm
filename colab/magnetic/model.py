@@ -76,7 +76,7 @@ class MagneticModel:
         t0 = time.time()
         for line in lines:
             words = tokenize(line)
-            if not words:
+            if len(words) < 2:
                 continue
             n_lines += 1
             for w in words:
