@@ -54,7 +54,7 @@ class MagneticConfig:
     # Jaccard similarity |N(a)∩N(b)| / |N(a)∪N(b)| that captures the
     # key insight: common words should repel rare words because their
     # edge sets barely overlap.
-    use_jaccard: bool = True
+    use_jaccard: bool = False
 
     # =====================================================================
     # Physics simulation

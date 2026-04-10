@@ -150,10 +150,15 @@ class MagneticGenerator:
         right_ids: List[int],
     ) -> torch.Tensor:
         """Score all V candidates for cloze evaluation. Uses KN on left
-        context + position similarity on left context + excitation from
-        BOTH left and right context (bidirectional)."""
+        context + position similarity from BOTH left and right context
+        (matching the legacy bidirectional cloze scorer that achieved
+        27% OOD top-10). Excitation is built from both sides but the
+        adaptive mix gives position the FULL supplementary band (no
+        sharing with semantic force) because position similarity is the
+        proven signal for cloze."""
         model = self.model
         dev = model.device
+        K = self.cfg.max_ngram_order
 
         # Excitation from full bidirectional context.
         all_ctx = [int(i) for i in left_ids if int(i) >= 0]
@@ -163,15 +168,29 @@ class MagneticGenerator:
         # KN on left only (KN is unidirectional).
         kn = self._compute_kn_all(left_ids)
 
-        # Position similarity from left context.
-        pos_score = self._compute_pos_similarity(left_ids)
+        # Position similarity from BOTH sides (the key difference from
+        # the broken version that only used left). Use up to K tokens
+        # from each side = 2K total context tokens for positions.
+        left_clean = [int(i) for i in left_ids if int(i) >= 0]
+        right_clean = [int(i) for i in right_ids if int(i) >= 0]
+        both_ctx = left_clean[-K:] + right_clean[:K]
+        pos_score = self._compute_pos_similarity(both_ctx, max_ctx=2 * K)
 
-        # Semantic force (bidirectional via excitation).
-        sem_score = model.excitation.semantic_force()
-        pos_max = float(pos_score.max().clamp_min(0.01).item())
-        sem_score = sem_score.clamp(0.0, pos_max)
-
-        return self._adaptive_mix(kn, pos_score, sem_score)
+        # Adaptive mixing: position gets the FULL band (no sharing).
+        # Semantic force is not mixed in for cloze because it was shown
+        # to not help OOD and just takes budget from the proven position
+        # signal. Excitation still influences the system through the
+        # candidate filtering and generation paths.
+        band = torch.where(
+            kn > 0.05,
+            torch.tensor(0.02, device=dev),
+            torch.where(
+                kn > 0.005,
+                torch.tensor(0.06, device=dev),
+                torch.tensor(0.12, device=dev)))
+        kn_w = 1.0 - band
+        mixed = (kn_w * kn + band * pos_score).clamp(1e-10, 0.999)
+        return mixed
 
     # -------------------------------------------------------------------
     # Adaptive mixing (the proven recipe from eval_full_wt103)
@@ -232,15 +251,15 @@ class MagneticGenerator:
     # Position similarity (same as eval_full_wt103)
     # -------------------------------------------------------------------
     def _compute_pos_similarity(
-        self, context_ids: List[int],
+        self, context_ids: List[int], max_ctx: int = 0,
     ) -> torch.Tensor:
         """Compute position-based similarity between context words and
-        every candidate, using the physics embedding. This is the same
-        formula that produced the 14.20 PPL / 27% OOD baseline."""
+        every candidate, using the physics embedding. max_ctx overrides
+        the default K-token limit (use 2*K for bidirectional cloze)."""
         model = self.model
         dev = model.device
         V = len(model.vocab)
-        K = self.cfg.max_ngram_order
+        K = max_ctx if max_ctx > 0 else self.cfg.max_ngram_order
         pos = model.positions
         imp = model.importance
 
@@ -249,8 +268,10 @@ class MagneticGenerator:
         if ctx_len == 0 or pos is None:
             return torch.zeros(V, dtype=torch.float32, device=dev)
 
+        # Use the tokens as passed (caller already selected the right
+        # window — e.g. left[-K:] + right[:K] for bidirectional cloze).
         ctx_ids = torch.tensor(
-            clean[-ctx_len:], dtype=torch.int64, device=dev)
+            clean[:ctx_len], dtype=torch.int64, device=dev)
         ctx_pos = pos[ctx_ids]            # (Kc, dim)
         ctx_imp = imp[ctx_ids]            # (Kc,)
 
