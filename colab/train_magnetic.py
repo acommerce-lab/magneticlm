@@ -29,7 +29,30 @@ import sys
 import time
 
 # Ensure the magnetic package is importable regardless of cwd.
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+
+# Diagnostic: verify the magnetic/ package directory actually exists
+# at the expected location. On Kaggle, dataset uploads sometimes
+# flatten subdirectories or strip __init__.py files.
+_PKG_DIR = os.path.join(_SCRIPT_DIR, "magnetic")
+if not os.path.isdir(_PKG_DIR):
+    print("FATAL: magnetic/ package directory not found at: %s" % _PKG_DIR)
+    print("Script location: %s" % _SCRIPT_DIR)
+    print("Contents:")
+    for f in sorted(os.listdir(_SCRIPT_DIR)):
+        print("  %s%s" % (f, "/" if os.path.isdir(
+            os.path.join(_SCRIPT_DIR, f)) else ""))
+    print("\nIf you uploaded this as a Kaggle dataset, make sure the "
+          "magnetic/ subdirectory and its __init__.py are included.")
+    sys.exit(2)
+if not os.path.isfile(os.path.join(_PKG_DIR, "__init__.py")):
+    print("FATAL: magnetic/__init__.py missing at: %s" % _PKG_DIR)
+    print("Contents of magnetic/:")
+    for f in sorted(os.listdir(_PKG_DIR)):
+        print("  %s" % f)
+    sys.exit(2)
 
 try:
     import torch

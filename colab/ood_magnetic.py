@@ -30,7 +30,14 @@ import sys
 import time
 
 # Ensure the magnetic package is importable regardless of cwd.
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+_PKG_DIR = os.path.join(_SCRIPT_DIR, "magnetic")
+if not os.path.isdir(_PKG_DIR):
+    print("FATAL: magnetic/ not found at %s" % _PKG_DIR)
+    print("Contents: %s" % sorted(os.listdir(_SCRIPT_DIR)))
+    sys.exit(2)
 
 try:
     import torch
