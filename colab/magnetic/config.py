@@ -45,6 +45,17 @@ class MagneticConfig:
     pmi_cap: float = 6.0       # clip |PPMI| at this value before normalising
     pmi_floor: float = 0.0     # weights whose PPMI is below this get zeroed
 
+    # Jaccard degree-ratio reweighting (the user's "relational
+    # differentiation" idea). For each edge (a, b), multiply the weight
+    # by min(degree_a, degree_b) / max(degree_a, degree_b). Edges
+    # between nodes with similar connectivity keep their weight; edges
+    # between a hub (degree 50k) and a specialist (degree 5) get
+    # suppressed by 1000x. This is a fast O(E) approximation of full
+    # Jaccard similarity |N(a)∩N(b)| / |N(a)∪N(b)| that captures the
+    # key insight: common words should repel rare words because their
+    # edge sets barely overlap.
+    use_jaccard: bool = True
+
     # =====================================================================
     # Physics simulation
     # =====================================================================
@@ -110,6 +121,14 @@ class MagneticConfig:
     # Chunk size when scoring candidates over the full vocabulary in
     # the generator (keeps per-step memory bounded).
     candidate_chunk_size: int = 32768
+
+    # For generation: only score the top-K KN candidates plus any
+    # excited words. This eliminates the "ghost words" problem where
+    # 100k rare words each get a tiny KN backoff probability and
+    # collectively swamp the good candidates. Matches the C# approach
+    # of `contextNeighbors.Union(excitedWords)` which was ~100-500
+    # candidates. Set to 0 to disable (score all V).
+    generation_topk: int = 500
 
     # =====================================================================
     # Multi-GPU

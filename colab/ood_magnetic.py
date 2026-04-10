@@ -186,6 +186,7 @@ def parse_args():
     ap.add_argument("--edge-window", type=int, default=2,
                     dest="edge_window")
     ap.add_argument("--no-pmi", action="store_true")
+    ap.add_argument("--no-jaccard", action="store_true")
 
     ap.add_argument("--alpha-contextual", type=float, default=0.6,
                     dest="alpha_contextual")
@@ -209,6 +210,7 @@ def build_config(args) -> MagneticConfig:
     cfg.multi_gpu = args.multi_gpu
     cfg.edge_window = args.edge_window
     cfg.use_pmi = not args.no_pmi
+    cfg.use_jaccard = not args.no_jaccard
     cfg.alpha_contextual = args.alpha_contextual
     cfg.beta_semantic = args.beta_semantic
     cfg.spreading_hops = args.spreading_hops
@@ -252,8 +254,8 @@ def main():
     print("  alpha=%.2f  beta=%.2f  spreading_hops=%d  hop_decay=%.2f" %
           (cfg.alpha_contextual, cfg.beta_semantic,
            cfg.spreading_hops, cfg.hop_decay))
-    print("  dim=%d  edge_window=%d  use_pmi=%s" %
-          (cfg.dim, cfg.edge_window, cfg.use_pmi))
+    print("  dim=%d  edge_window=%d  use_pmi=%s  use_jaccard=%s" %
+          (cfg.dim, cfg.edge_window, cfg.use_pmi, cfg.use_jaccard))
     print("=" * 72)
     t0 = time.time()
     res = evaluator.ood_cloze(OOD_TESTS, top_k=args.top_k, verbose=True)

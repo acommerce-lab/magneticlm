@@ -122,8 +122,8 @@ class MagneticModel:
 
         # Semantic edges (with optional PMI reweighting).
         t0 = time.time()
-        print("  Semantic edges (window +/-%d, PMI=%s)..." %
-              (cfg.edge_window, cfg.use_pmi),
+        print("  Semantic edges (window +/-%d, PMI=%s, Jaccard=%s)..." %
+              (cfg.edge_window, cfg.use_pmi, cfg.use_jaccard),
               end="", flush=True)
         self.edges = self._edge_builder.build(
             tokens_gpu, self.freq_gpu, V, self.device)

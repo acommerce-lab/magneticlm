@@ -96,6 +96,8 @@ class EdgeBuilder:
         edges = self._build_base(tokens_gpu, vocab_size, device)
         if cfg.use_pmi and edges.numel() > 0:
             edges = self._apply_pmi(edges, freq_gpu, tokens_gpu.numel(), device)
+        if cfg.use_jaccard and edges.numel() > 0:
+            edges = self._apply_jaccard(edges, device)
         return edges
 
     # -------------------------------------------------------------------
@@ -243,4 +245,61 @@ class EdgeBuilder:
             edge_to=edges.edge_to[mask].contiguous(),
             edge_weight=new_w[mask].contiguous(),
             num_nodes=edges.num_nodes,
+        )
+
+    # -------------------------------------------------------------------
+    # Stage 3: Jaccard degree-ratio reweighting
+    # -------------------------------------------------------------------
+    # The user's "relational differentiation" idea: the strength of the
+    # link between two words should depend on how SIMILAR their
+    # connectivity patterns are. Two words that connect to the SAME set
+    # of neighbours (synonyms) keep their full weight. A hub word
+    # (degree 50k) linked to a specialist (degree 5) gets suppressed
+    # because their edge sets barely overlap.
+    #
+    # Full Jaccard = |N(a) ∩ N(b)| / |N(a) ∪ N(b)| is O(E * degree)
+    # and hard to vectorise on GPU for large graphs. This uses the
+    # degree-ratio approximation:
+    #
+    #   ratio = min(deg_a, deg_b) / max(deg_a, deg_b)
+    #
+    # which is O(E), fully vectorised, and captures the primary signal:
+    # degree MISMATCH implies low Jaccard (a node with 5 neighbours
+    # can share at most 5 with a node that has 50000, giving Jaccard
+    # ≤ 5/50000 = 0.0001, while ratio = 5/50000 = 0.0001).
+    #
+    # For equal-degree nodes the ratio is 1.0 regardless of whether
+    # their actual neighbours overlap, which is an over-estimate of
+    # Jaccard. A future improvement could use sampled intersection
+    # counts to refine this.
+    def _apply_jaccard(
+        self,
+        edges: EdgeSet,
+        device: torch.device,
+    ) -> EdgeSet:
+        if edges.numel() == 0:
+            return edges
+
+        V = edges.num_nodes
+        E = edges.numel()
+
+        # Out-degree per node (= number of unique neighbours for
+        # symmetric edges).
+        degree = torch.zeros(V, dtype=torch.float32, device=device)
+        degree.scatter_add_(
+            0, edges.edge_from,
+            torch.ones(E, dtype=torch.float32, device=device))
+        degree = degree.clamp_min(1.0)
+
+        da = degree[edges.edge_from]
+        db = degree[edges.edge_to]
+        ratio = torch.minimum(da, db) / torch.maximum(da, db)
+
+        new_w = edges.edge_weight * ratio
+        mask = new_w >= self.config.semantic_threshold
+        return EdgeSet(
+            edge_from=edges.edge_from[mask].contiguous(),
+            edge_to=edges.edge_to[mask].contiguous(),
+            edge_weight=new_w[mask].contiguous(),
+            num_nodes=V,
         )

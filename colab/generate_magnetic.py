@@ -84,6 +84,9 @@ def parse_args():
     ap.add_argument("--edge-window", type=int, default=2,
                     dest="edge_window")
     ap.add_argument("--no-pmi", action="store_true")
+    ap.add_argument("--no-jaccard", action="store_true")
+    ap.add_argument("--generation-topk", type=int, default=500,
+                    dest="generation_topk")
 
     ap.add_argument("--alpha-contextual", type=float, default=0.6,
                     dest="alpha_contextual")
@@ -115,6 +118,8 @@ def build_config(args) -> MagneticConfig:
     cfg.multi_gpu = args.multi_gpu
     cfg.edge_window = args.edge_window
     cfg.use_pmi = not args.no_pmi
+    cfg.use_jaccard = not args.no_jaccard
+    cfg.generation_topk = args.generation_topk
     cfg.alpha_contextual = args.alpha_contextual
     cfg.beta_semantic = args.beta_semantic
     cfg.spreading_hops = args.spreading_hops

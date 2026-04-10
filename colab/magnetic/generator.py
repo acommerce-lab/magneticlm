@@ -100,8 +100,17 @@ class MagneticGenerator:
         # Full KN scores for all V candidates.
         kn = self._compute_kn_all(history)
 
-        # Candidate mask: KN > floor OR excited above threshold.
-        kn_mask = kn > 1e-6
+        # Candidate filtering: top-K by KN score + any excited words.
+        # This eliminates "ghost words" — the 100k+ rare words that
+        # each get a tiny KN backoff probability and collectively swamp
+        # the good candidates when sampled via softmax.
+        topk = int(cfg.generation_topk)
+        if topk > 0 and topk < V:
+            _, topk_idx = torch.topk(kn, k=min(topk, V))
+            kn_mask = torch.zeros(V, dtype=torch.bool, device=dev)
+            kn_mask[topk_idx] = True
+        else:
+            kn_mask = kn > 1e-6
         exc_mask = model.excitation.excitation > float(cfg.excitation_threshold)
         candidates = kn_mask | exc_mask
 

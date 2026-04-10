@@ -106,6 +106,8 @@ def parse_args():
                     dest="edge_window")
     ap.add_argument("--no-pmi", action="store_true",
                     help="Disable PMI reweighting to reproduce C# exactly")
+    ap.add_argument("--no-jaccard", action="store_true",
+                    help="Disable Jaccard degree-ratio edge reweighting")
 
     # Inference weights (used only by cloze eval)
     ap.add_argument("--alpha-contextual", type=float, default=0.6,
@@ -138,6 +140,7 @@ def build_config(args) -> MagneticConfig:
     cfg.low_order_max = args.low_order_max
     cfg.edge_window = args.edge_window
     cfg.use_pmi = not args.no_pmi
+    cfg.use_jaccard = not args.no_jaccard
     cfg.alpha_contextual = args.alpha_contextual
     cfg.beta_semantic = args.beta_semantic
     cfg.spreading_hops = args.spreading_hops
@@ -173,8 +176,8 @@ def main():
     print("  MagneticLM Modular Runner")
     print("  max_order=%d  dim=%d  physics_iters=%d" %
           (cfg.max_ngram_order, cfg.dim, cfg.physics_iters))
-    print("  edge_window=%d  use_pmi=%s" %
-          (cfg.edge_window, cfg.use_pmi))
+    print("  edge_window=%d  use_pmi=%s  use_jaccard=%s" %
+          (cfg.edge_window, cfg.use_pmi, cfg.use_jaccard))
     print("  alpha=%.2f  beta=%.2f  spreading_hops=%d  hop_decay=%.2f" %
           (cfg.alpha_contextual, cfg.beta_semantic,
            cfg.spreading_hops, cfg.hop_decay))
