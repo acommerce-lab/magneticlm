@@ -148,14 +148,17 @@ class MagneticModel:
         self.importance = compute_importance(
             V, self.edges.edge_from, self.freq_gpu, self.device)
 
-        # Excitation engine (ready for inference).
+        # Excitation engine (ready for inference). Pass freq_gpu so
+        # prompt excitation can be IDF-weighted (common words in the
+        # prompt contribute less, preventing specialist-phrase dominance).
         self.excitation = ExcitationEngine(
             cfg,
             self.edges.edge_from,
             self.edges.edge_to,
             self.edges.edge_weight,
             V,
-            self.device)
+            self.device,
+            freq_gpu=self.freq_gpu)
 
         print("  Model ready. Total time: %.0fs" % (time.time() - t_all))
 

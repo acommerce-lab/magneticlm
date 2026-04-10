@@ -42,27 +42,33 @@ class ExcitationEngine:
         edge_weight: torch.Tensor,
         num_nodes: int,
         device: torch.device,
+        freq_gpu: torch.Tensor = None,
     ):
         self.config = config
         self.device = device
         self.N = int(num_nodes)
 
-        # Edges are already directed and symmetric - we keep them as
-        # flat tensors and do the forward pass as:
-        #   neighbour_score[to[i]] += excitation[from[i]] * weight[i]
-        # which is one scatter_add per pass.
         self.edge_from = edge_from.to(device)
         self.edge_to = edge_to.to(device)
         self.edge_weight = edge_weight.to(device)
 
-        # Normalisation factor used to keep the summed semantic force
-        # in a comparable range regardless of graph density. max
-        # possible semantic force ~ max_edge_weight * num_excited.
         self.max_edge_weight = (
             float(self.edge_weight.abs().max().item())
             if self.edge_weight.numel() > 0 else 1.0)
         if self.max_edge_weight < 1e-9:
             self.max_edge_weight = 1.0
+
+        # IDF weights: log(V / (freq + 1)), normalised to [0, 1].
+        # Common words ("the", "and") get low IDF → low excitation.
+        # Rare content words ("england", "king") get high IDF → high
+        # excitation. This prevents specialist words that only connect
+        # to common words from dominating via degree-normalised average.
+        if freq_gpu is not None:
+            freq = freq_gpu.to(device).float().clamp_min(1.0)
+            raw_idf = torch.log(float(num_nodes) / freq)
+            self.idf = (raw_idf / raw_idf.max().clamp_min(1e-9)).clamp(0.01, 1.0)
+        else:
+            self.idf = torch.ones(self.N, dtype=torch.float32, device=device)
 
         self.excitation = torch.zeros(self.N, dtype=torch.float32, device=device)
         self.repulsion = torch.zeros(self.N, dtype=torch.float32, device=device)
@@ -97,6 +103,11 @@ class ExcitationEngine:
                 v = high
             else:
                 v = low + (high - low) * (i / (P - 1))
+            # Scale by IDF: "the" (IDF≈0.02) gets v≈0.01, while
+            # "england" (IDF≈0.8) gets v≈0.4. This prevents common
+            # words in the prompt from exciting specialist phrases
+            # that always co-occur with them (e.g. "midst", "accordance").
+            v = v * float(self.idf[tid].item())
             cur = float(self.excitation[tid].item())
             if v > cur:
                 self.excitation[tid] = float(v)
