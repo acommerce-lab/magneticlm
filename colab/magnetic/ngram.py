@@ -174,9 +174,13 @@ class NgramTables:
     # Per-order counting with incremental chunk merging
     # -------------------------------------------------------------------
     def _count_order(self, tokens_gpu: torch.Tensor, order: int, tdev: torch.device):
+        """Count n-grams of size (order+1): context of `order` tokens
+        plus one next word. Faithful port of MagneticLMFastRunner.py
+        _count_ngrams_order (lines 251-362), the tested implementation
+        that achieves 14.20 PPL."""
         src_dev = tokens_gpu.device
         T = tokens_gpu.numel()
-        if T < order:
+        if T <= order:
             empty_i = torch.empty(0, dtype=torch.int64, device=tdev)
             empty_l = torch.empty(0, dtype=torch.int64, device=tdev)
             self.ngram_hash_sorted[order] = empty_i
@@ -188,181 +192,131 @@ class NgramTables:
             self.ctx_uf[order] = empty_l
             return
 
-        primes = self.primes_on(tdev)
+        # Move tokens to the target device if needed (multi-GPU: high
+        # orders may live on cuda:1).
+        if src_dev == tdev:
+            tokens = tokens_gpu
+            tokens_is_copy = False
+        else:
+            tokens = tokens_gpu.to(tdev)
+            tokens_is_copy = True
 
-        master_ng: Optional[torch.Tensor] = None
-        master_cnt: Optional[torch.Tensor] = None
-        master_ctx: Optional[torch.Tensor] = None
-        master_ctx_cnt: Optional[torch.Tensor] = None
+        primes = self.primes_on(tdev)
+        primes_ctx = primes[:order]      # hash first `order` tokens
+        primes_ng = primes[:order + 1]   # hash all `order+1` tokens
+
+        # Master accumulators (start empty).
+        master_ng = torch.empty(0, dtype=torch.int64, device=tdev)
+        master_cnt = torch.empty(0, dtype=torch.int64, device=tdev)
+        master_ctx = torch.empty(0, dtype=torch.int64, device=tdev)
 
         chunk = _adaptive_chunk(order)
-        # Number of n-gram starting positions is T - order + 1.
-        total_pos = T - order + 1
+        nG = T - order   # number of valid (order+1)-token windows
 
-        for start in range(0, total_pos, chunk):
-            end = min(start + chunk, total_pos)
+        start = 0
+        while start < nG:
+            end = min(start + chunk, nG)
+            # tok_slice has (end - start + order) tokens so the sliding
+            # window tok_slice[k : L+k] works for k in 0..order.
+            tok_slice = tokens[start:end + order]
+            L = tok_slice.numel() - order
 
-            # Build the (B, order) window of tokens for this chunk on the
-            # source device, then move to tdev (which may differ for
-            # high-order tables in multi-GPU mode).
-            idx = torch.arange(start, end, dtype=torch.int64, device=src_dev)
-            win = torch.stack(
-                [tokens_gpu[idx + j] for j in range(order)], dim=1)
-            if tdev != src_dev:
-                win = win.to(tdev)
+            # Polynomial hash for the (order+1)-token n-gram.
+            ngram_h = torch.zeros(L, dtype=torch.int64, device=tdev)
+            for k in range(order + 1):
+                ngram_h += tok_slice[k:L + k] * primes_ng[k]
 
-            # N-gram hash (full window)
-            ngram_h = (win * primes[:order]).sum(dim=1)
-            # Context hash (first order-1 tokens; context for this order)
-            if order >= 2:
-                ctx_h = (win[:, :-1] * primes[:order - 1]).sum(dim=1)
-            else:
-                ctx_h = torch.zeros(win.size(0), dtype=torch.int64, device=tdev)
+            # Polynomial hash for the order-token context.
+            ctx_h = torch.zeros(L, dtype=torch.int64, device=tdev)
+            for k in range(order):
+                ctx_h += tok_slice[k:L + k] * primes_ctx[k]
 
-            del win, idx
+            # Unique n-grams in this chunk + their counts.
+            uniq_ng, inverse, counts = torch.unique(
+                ngram_h, return_inverse=True, return_counts=True)
+            del ngram_h
 
-            # Unique n-grams in this chunk and their counts.
-            uh, inv = torch.unique(ngram_h, return_inverse=True)
-            cnt = torch.zeros(uh.numel(), dtype=torch.int64, device=tdev)
-            ones = torch.ones(ngram_h.numel(), dtype=torch.int64, device=tdev)
-            cnt.scatter_add_(0, inv, ones)
-            del ones, inv, ngram_h
+            # For each unique n-gram pick a stable ctx hash via
+            # the first position where it appeared (scatter_reduce amin).
+            positions = torch.arange(L, dtype=torch.int64, device=tdev)
+            first_pos = torch.full(
+                (uniq_ng.numel(),), L,
+                dtype=torch.int64, device=tdev)
+            first_pos.scatter_reduce_(
+                0, inverse, positions,
+                reduce='amin', include_self=True)
+            ctx_for_uniq = ctx_h[first_pos.clamp_max(L - 1)]
+            del positions, first_pos, inverse, ctx_h, tok_slice
 
-            # Unique contexts for this chunk and their counts.
-            uctx, cinv = torch.unique(ctx_h, return_inverse=True)
-            cctx = torch.zeros(uctx.numel(), dtype=torch.int64, device=tdev)
-            ones = torch.ones(ctx_h.numel(), dtype=torch.int64, device=tdev)
-            cctx.scatter_add_(0, cinv, ones)
-            del ones, cinv, ctx_h
+            # ---- Incremental merge into master tables ----
+            merged_ng = torch.cat([master_ng, uniq_ng])
+            merged_cnt = torch.cat([master_cnt, counts])
+            merged_ctx = torch.cat([master_ctx, ctx_for_uniq])
+            del master_ng, master_cnt, master_ctx
+            del uniq_ng, counts, ctx_for_uniq
 
-            # Merge into the running master tables (for both ngrams
-            # and contexts). This keeps peak memory at ~2x per-chunk
-            # instead of collecting a Python list.
-            if master_ng is None:
-                master_ng = uh
-                master_cnt = cnt
-                master_ctx = uctx
-                master_ctx_cnt = cctx
-            else:
-                merged_h = torch.cat([master_ng, uh])
-                merged_c = torch.cat([master_cnt, cnt])
-                uh2, inv2 = torch.unique(merged_h, return_inverse=True)
-                cnt2 = torch.zeros(
-                    uh2.numel(), dtype=torch.int64, device=tdev)
-                cnt2.scatter_add_(0, inv2, merged_c)
-                master_ng = uh2
-                master_cnt = cnt2
-                del merged_h, merged_c, inv2, uh, cnt
+            new_uniq, new_inv = torch.unique(
+                merged_ng, return_inverse=True)
+            new_cnt = torch.zeros(
+                new_uniq.numel(), dtype=torch.int64, device=tdev)
+            new_cnt.scatter_add_(0, new_inv, merged_cnt)
+            new_ctx = torch.full(
+                (new_uniq.numel(),), torch.iinfo(torch.int64).max,
+                dtype=torch.int64, device=tdev)
+            new_ctx.scatter_reduce_(
+                0, new_inv, merged_ctx,
+                reduce='amin', include_self=True)
+            del merged_ng, merged_cnt, merged_ctx, new_inv
 
-                merged_cx = torch.cat([master_ctx, uctx])
-                merged_cc = torch.cat([master_ctx_cnt, cctx])
-                uc2, cinv2 = torch.unique(merged_cx, return_inverse=True)
-                cc2 = torch.zeros(
-                    uc2.numel(), dtype=torch.int64, device=tdev)
-                cc2.scatter_add_(0, cinv2, merged_cc)
-                master_ctx = uc2
-                master_ctx_cnt = cc2
-                del merged_cx, merged_cc, cinv2, uctx, cctx
+            master_ng = new_uniq
+            master_cnt = new_cnt
+            master_ctx = new_ctx
+            del new_uniq, new_cnt, new_ctx
 
+            start = end
             if tdev.type == "cuda":
                 torch.cuda.empty_cache()
 
-        # Derive per-context aggregates (count1, count2, unique
-        # followers) from the master n-gram table.
-        if master_ng is None or master_ng.numel() == 0:
+        # ---- Per-context aggregates ----
+        if master_ng.numel() == 0:
+            empty_i = torch.empty(0, dtype=torch.int64, device=tdev)
             empty_l = torch.empty(0, dtype=torch.int64, device=tdev)
-            self.ngram_hash_sorted[order] = torch.empty(0, dtype=torch.int64, device=tdev)
+            self.ngram_hash_sorted[order] = empty_i
             self.ngram_count[order] = empty_l
-            self.ctx_hash_sorted[order] = torch.empty(0, dtype=torch.int64, device=tdev)
+            self.ctx_hash_sorted[order] = empty_i
             self.ctx_total[order] = empty_l
             self.ctx_count1[order] = empty_l
             self.ctx_count2[order] = empty_l
             self.ctx_uf[order] = empty_l
+            if tokens_is_copy:
+                del tokens
             return
 
-        # Re-derive the context hash for each master ngram, then scatter
-        # aggregates into positions aligned with the master context table.
-        # This is cheap because master_ng is small compared to T.
-        if order >= 2:
-            # Recover the window from the hash? Not invertible. Instead
-            # we recompute per-n-gram context hashes directly by taking
-            # the first order-1 primes, but since we don't have the
-            # original tokens here we need to pass them through. The
-            # easiest solution is: we do one more pass over the chunks
-            # to collect (ctx_hash, ngram_count) tuples. Use a small
-            # scan: build a mapping from master_ng -> its context hash
-            # by walking the chunks a second time.
-            ctx_for_ng = torch.empty_like(master_ng)
-            # The master_ng tensor is sorted by torch.unique so we can
-            # binary search it.
-            master_ng_sorted, sort_perm = torch.sort(master_ng)
-            inv_perm = torch.empty_like(sort_perm)
-            inv_perm[sort_perm] = torch.arange(
-                master_ng.numel(), device=tdev)
+        uniq_ctx, ctx_inv = torch.unique(master_ctx, return_inverse=True)
+        U = uniq_ctx.numel()
+        ctx_total = torch.zeros(U, dtype=torch.int64, device=tdev)
+        ctx_total.scatter_add_(0, ctx_inv, master_cnt)
+        ctx_count1 = torch.zeros(U, dtype=torch.int64, device=tdev)
+        ctx_count1.scatter_add_(0, ctx_inv, (master_cnt == 1).to(torch.int64))
+        ctx_count2 = torch.zeros(U, dtype=torch.int64, device=tdev)
+        ctx_count2.scatter_add_(0, ctx_inv, (master_cnt == 2).to(torch.int64))
+        ctx_uf = torch.zeros(U, dtype=torch.int64, device=tdev)
+        ctx_uf.scatter_add_(0, ctx_inv, torch.ones_like(master_cnt))
 
-            for start in range(0, total_pos, chunk):
-                end = min(start + chunk, total_pos)
-                idx = torch.arange(
-                    start, end, dtype=torch.int64, device=src_dev)
-                win = torch.stack(
-                    [tokens_gpu[idx + j] for j in range(order)], dim=1)
-                if tdev != src_dev:
-                    win = win.to(tdev)
-                ng_h = (win * primes[:order]).sum(dim=1)
-                ct_h = (win[:, :-1] * primes[:order - 1]).sum(dim=1)
-                del win, idx
+        # master_ng and uniq_ctx are already sorted (torch.unique output).
+        self.ngram_hash_sorted[order] = master_ng
+        self.ngram_count[order] = master_cnt
+        self.ctx_hash_sorted[order] = uniq_ctx
+        self.ctx_total[order] = ctx_total
+        self.ctx_count1[order] = ctx_count1
+        self.ctx_count2[order] = ctx_count2
+        self.ctx_uf[order] = ctx_uf
 
-                # Find each chunk n-gram in the sorted master table.
-                pos = torch.searchsorted(master_ng_sorted, ng_h)
-                # In this construction the n-grams are guaranteed to
-                # match; still clamp defensively.
-                pos = pos.clamp_max(master_ng_sorted.numel() - 1)
-                orig_idx = sort_perm[pos]
-                ctx_for_ng[orig_idx] = ct_h
-                del ng_h, ct_h, pos, orig_idx
-                if tdev.type == "cuda":
-                    torch.cuda.empty_cache()
-        else:
-            # Order 1: context is the empty sequence, always hashed to 0.
-            ctx_for_ng = torch.zeros_like(master_ng)
-
-        # Sort master_ng for searchsorted lookups during eval.
-        ng_sorted, ng_perm = torch.sort(master_ng)
-        ng_count_sorted = master_cnt[ng_perm]
-        ctx_for_ng_sorted = ctx_for_ng[ng_perm]
-        del master_ng, master_cnt, ctx_for_ng, ng_perm
-
-        # Sort master_ctx for searchsorted lookups during eval.
-        ctx_sorted, ctx_perm = torch.sort(master_ctx)
-        ctx_count_sorted = master_ctx_cnt[ctx_perm]
-        del master_ctx, master_ctx_cnt, ctx_perm
-
-        # Map each n-gram's context to its index in the sorted context
-        # table so we can fold count1 / count2 / unique_followers.
-        ctx_idx = torch.searchsorted(ctx_sorted, ctx_for_ng_sorted)
-        ctx_idx = ctx_idx.clamp_max(ctx_sorted.numel() - 1)
-
-        ctx_count1 = torch.zeros(ctx_sorted.numel(), dtype=torch.int64, device=tdev)
-        ctx_count2 = torch.zeros(ctx_sorted.numel(), dtype=torch.int64, device=tdev)
-        ctx_uf     = torch.zeros(ctx_sorted.numel(), dtype=torch.int64, device=tdev)
-
-        mask1 = (ng_count_sorted == 1)
-        mask2 = (ng_count_sorted == 2)
-        ones_i64 = torch.ones(ng_count_sorted.numel(), dtype=torch.int64, device=tdev)
-
-        ctx_count1.scatter_add_(0, ctx_idx, mask1.to(torch.int64))
-        ctx_count2.scatter_add_(0, ctx_idx, mask2.to(torch.int64))
-        ctx_uf.scatter_add_(0, ctx_idx, ones_i64)
-
-        del mask1, mask2, ones_i64, ctx_for_ng_sorted, ctx_idx
-
-        self.ngram_hash_sorted[order] = ng_sorted
-        self.ngram_count[order]       = ng_count_sorted
-        self.ctx_hash_sorted[order]   = ctx_sorted
-        self.ctx_total[order]         = ctx_count_sorted
-        self.ctx_count1[order]        = ctx_count1
-        self.ctx_count2[order]        = ctx_count2
-        self.ctx_uf[order]            = ctx_uf
+        del master_ctx, ctx_inv
+        if tokens_is_copy:
+            del tokens
+        if tdev.type == "cuda":
+            torch.cuda.empty_cache()
 
     # -------------------------------------------------------------------
     # Continuation counts (unique contexts following each word)
