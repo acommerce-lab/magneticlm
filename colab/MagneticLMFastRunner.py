@@ -118,10 +118,17 @@ class MagneticLMGPU:
     eval all live on CUDA tensors. With multi_gpu=True the per-order n-gram
     tables are split across two CUDA devices."""
 
-    def __init__(self, device, max_order=5, multi_gpu=False):
+    def __init__(self, device, max_order=5, multi_gpu=False, dim=3):
         self.device = device
         self.max_order = max_order
         self.MAX_ORDER = max_order  # back-compat for any external reader
+        # Embedding dimension for physics positions. Default 3 preserves the
+        # original 3D runner. Higher dims (16/32/64) give cosine similarity
+        # actual room to cluster 100k+ vocab words by role; 3D is so cramped
+        # that every word ends up quasi-close to every other word, which the
+        # OOD cloze experiment confirmed empirically (OOD top-10 stuck at
+        # ~30% even when position_weight was swept 0.05 to 0.50).
+        self.dim = dim
 
         # Devices: tokens + low-order tables + physics on `device`,
         # high-order tables on aux_device when multi_gpu is on.
@@ -568,8 +575,16 @@ class MagneticLMGPU:
         edge_w = self.edge_weight
 
         torch.manual_seed(42)
-        positions = (torch.rand((N, 3), device=dev, dtype=torch.float32) * 10.0 - 5.0)
-        velocities = torch.zeros((N, 3), device=dev, dtype=torch.float32)
+        # Scale the initial range so E[||x||] stays ~5 regardless of dim.
+        # Uniform in [-a, a] has var = a^2/3 per coord, so E[||x||^2] = D*a^2/3.
+        # Setting this to 25 (a = 5*sqrt(3/D)) keeps initial norms comparable
+        # to the D=3 baseline, which means max_radius, gravity, optimal_dist
+        # and the spring/repulsion constants don't need per-dim retuning.
+        # For D=3 this reduces to the original [-5, 5] range exactly.
+        init_range = 5.0 * math.sqrt(3.0 / float(self.dim))
+        positions = (torch.rand((N, self.dim), device=dev, dtype=torch.float32)
+                     * (2.0 * init_range) - init_range)
+        velocities = torch.zeros((N, self.dim), device=dev, dtype=torch.float32)
 
         K_context = 2.0
         K_frequency = 1.5
@@ -833,8 +848,8 @@ class MagneticLMGPU:
             # === Position similarity (the magnetic contribution) ===
             safe_ctx = ctx_batch.clamp_min(0)
             safe_nxt = nxt.clamp_min(0)
-            ctx_pos = pos[safe_ctx]                       # (B, K, 3)
-            nxt_pos = pos[safe_nxt].unsqueeze(1)          # (B, 1, 3)
+            ctx_pos = pos[safe_ctx]                       # (B, K, dim)
+            nxt_pos = pos[safe_nxt].unsqueeze(1)          # (B, 1, dim)
             dot = (ctx_pos * nxt_pos).sum(-1)             # (B, K)
             ctx_norm = ctx_pos.norm(dim=-1)
             nxt_norm = nxt_pos.norm(dim=-1)
@@ -906,7 +921,19 @@ def main():
                          "overhead, halves the peak memory on cuda:0.")
     ap.add_argument("--data-dir", default="data/wt103",
                     help="Directory for WikiText-103 train.txt / test.txt")
+    ap.add_argument("--dim", type=int, default=3,
+                    help="Embedding dimension for physics positions. "
+                         "3 is the original (and the baseline that reached "
+                         "14.20 PPL on 860k lines). Higher dims (16/32/64) "
+                         "give cosine similarity enough room to cluster "
+                         "100k+ words by role. Physics cost scales roughly "
+                         "linearly with dim; 32 adds ~10x to the physics "
+                         "step time but is still seconds on a T4.")
     args = ap.parse_args()
+
+    if args.dim < 1 or args.dim > 512:
+        print("ERROR: --dim must be in the range [1, 512].", file=sys.stderr)
+        sys.exit(2)
 
     if args.max_order < 2 or args.max_order > 9:
         print("ERROR: --max-order must be in the range [2, 9]. "
@@ -956,15 +983,16 @@ def main():
 
     print("\n" + "=" * 60)
     print("  MagneticLM Fast Runner (GPU, no cache, full mode)")
-    print("  max_order=%d  multi_gpu=%s" %
-          (args.max_order, args.multi_gpu and n_dev >= 2))
+    print("  max_order=%d  multi_gpu=%s  dim=%d" %
+          (args.max_order, args.multi_gpu and n_dev >= 2, args.dim))
     print("=" * 60)
 
     t_all = time.time()
     model = MagneticLMGPU(
         device=device,
         max_order=args.max_order,
-        multi_gpu=args.multi_gpu and n_dev >= 2)
+        multi_gpu=args.multi_gpu and n_dev >= 2,
+        dim=args.dim)
 
     t0 = time.time()
     model.train_gpu(train)

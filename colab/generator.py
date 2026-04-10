@@ -278,6 +278,8 @@ def main():
     ap.add_argument("--train-lines", type=int, default=10000)
     ap.add_argument("--physics-iters", type=int, default=100)
     ap.add_argument("--max-order", type=int, default=4)
+    ap.add_argument("--dim", type=int, default=3,
+                    help="Physics embedding dimension (3 = original).")
     ap.add_argument("--data-dir", default="data/wt103")
 
     ap.add_argument("--prompt", type=str, default=None,
@@ -323,11 +325,11 @@ def main():
                 break
     print("Loaded %d lines" % len(train))
 
-    print("Building model (max_order=%d, physics_iters=%d)..." %
-          (args.max_order, args.physics_iters))
+    print("Building model (max_order=%d, physics_iters=%d, dim=%d)..." %
+          (args.max_order, args.physics_iters, args.dim))
     t0 = time.time()
     model = MagneticLMGPU(device=device, max_order=args.max_order,
-                          multi_gpu=False)
+                          multi_gpu=False, dim=args.dim)
     model.train_gpu(train)
     model.build(physics_iters=args.physics_iters)
     print("Build time: %.1fs" % (time.time() - t0))
