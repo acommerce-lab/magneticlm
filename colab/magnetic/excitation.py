@@ -160,15 +160,7 @@ class ExcitationEngine:
         out = torch.zeros(self.N, dtype=torch.float32, device=self.device)
         out.scatter_add_(0, self.edge_to, contrib)
 
-        # --- Degree-normalized semantic force ---
-        # Raw scatter_add gives the SUM of contributions. Hub words
-        # like "the" receive contributions from 50k+ edges and their
-        # sum dwarfs meaningful words by 100x (the hubness problem
-        # identified in the Gemini discussion). Fix: divide by the
-        # in-degree from excited nodes so we get the AVERAGE
-        # contribution per excited neighbour, not the raw sum.
-        # This matches the user's insight that hub nodes should not
-        # benefit from sheer edge count.
+        # Degree-normalized: average contribution per excited neighbour.
         excited_contrib_count = torch.zeros(
             self.N, dtype=torch.float32, device=self.device)
         excited_mask = (eff[self.edge_from] > 0).float()
@@ -177,11 +169,10 @@ class ExcitationEngine:
         excited_contrib_count = excited_contrib_count.clamp_min(1.0)
         out = out / excited_contrib_count
 
-        # Normalise to [0, 1] so the scale is comparable to KN
-        # probabilities when mixed via alpha*kn + beta*semantic.
-        mx = float(out.max().item()) if out.numel() > 0 else 0.0
-        if mx > 1e-9:
-            out = out / mx
+        # DO NOT normalize to [0,1] — that amplifies noise when total
+        # excitation is low (IDF suppresses common prompt words). The
+        # raw degree-averaged values are used by the generator with
+        # adaptive mixing that handles scaling properly.
         return out
 
     # -------------------------------------------------------------------
