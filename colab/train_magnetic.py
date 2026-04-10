@@ -28,31 +28,42 @@ import os
 import sys
 import time
 
-# Ensure the magnetic package is importable regardless of cwd.
-_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-if _SCRIPT_DIR not in sys.path:
-    sys.path.insert(0, _SCRIPT_DIR)
+def _setup_magnetic_import():
+    """Make `import magnetic` work in two layouts:
+    1. Normal (git clone): magnetic/ is a subdirectory beside this script.
+    2. Flat (Kaggle dataset upload): all .py files are in one directory.
+    For case 2, we copy the package files into /tmp/magnetic/ at runtime."""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    pkg_dir = os.path.join(script_dir, "magnetic")
 
-# Diagnostic: verify the magnetic/ package directory actually exists
-# at the expected location. On Kaggle, dataset uploads sometimes
-# flatten subdirectories or strip __init__.py files.
-_PKG_DIR = os.path.join(_SCRIPT_DIR, "magnetic")
-if not os.path.isdir(_PKG_DIR):
-    print("FATAL: magnetic/ package directory not found at: %s" % _PKG_DIR)
-    print("Script location: %s" % _SCRIPT_DIR)
-    print("Contents:")
-    for f in sorted(os.listdir(_SCRIPT_DIR)):
-        print("  %s%s" % (f, "/" if os.path.isdir(
-            os.path.join(_SCRIPT_DIR, f)) else ""))
-    print("\nIf you uploaded this as a Kaggle dataset, make sure the "
-          "magnetic/ subdirectory and its __init__.py are included.")
-    sys.exit(2)
-if not os.path.isfile(os.path.join(_PKG_DIR, "__init__.py")):
-    print("FATAL: magnetic/__init__.py missing at: %s" % _PKG_DIR)
-    print("Contents of magnetic/:")
-    for f in sorted(os.listdir(_PKG_DIR)):
-        print("  %s" % f)
-    sys.exit(2)
+    # Case 1: subdirectory exists
+    if os.path.isdir(pkg_dir) and os.path.isfile(
+            os.path.join(pkg_dir, "__init__.py")):
+        if script_dir not in sys.path:
+            sys.path.insert(0, script_dir)
+        return
+
+    # Case 2: flat layout — reconstruct the package in /tmp
+    if not os.path.isfile(os.path.join(script_dir, "config.py")):
+        print("FATAL: cannot find magnetic package modules.", file=sys.stderr)
+        sys.exit(2)
+
+    import shutil
+    import tempfile
+    tmp_root = tempfile.mkdtemp(prefix="magnetic_pkg_")
+    tmp_pkg = os.path.join(tmp_root, "magnetic")
+    os.makedirs(tmp_pkg)
+    for fname in sorted(os.listdir(script_dir)):
+        if not fname.endswith(".py"):
+            continue
+        if "_magnetic" in fname:
+            continue  # CLI script, skip
+        shutil.copy2(os.path.join(script_dir, fname),
+                     os.path.join(tmp_pkg, fname))
+    sys.path.insert(0, tmp_root)
+    print("  (rebuilt magnetic/ package in %s)" % tmp_pkg)
+
+_setup_magnetic_import()
 
 try:
     import torch

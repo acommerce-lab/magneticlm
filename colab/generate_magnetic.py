@@ -31,15 +31,29 @@ import os
 import sys
 import time
 
-# Ensure the magnetic package is importable regardless of cwd.
-_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-if _SCRIPT_DIR not in sys.path:
-    sys.path.insert(0, _SCRIPT_DIR)
-_PKG_DIR = os.path.join(_SCRIPT_DIR, "magnetic")
-if not os.path.isdir(_PKG_DIR):
-    print("FATAL: magnetic/ not found at %s" % _PKG_DIR)
-    print("Contents: %s" % sorted(os.listdir(_SCRIPT_DIR)))
-    sys.exit(2)
+def _setup_magnetic_import():
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    pkg_dir = os.path.join(script_dir, "magnetic")
+    if os.path.isdir(pkg_dir) and os.path.isfile(
+            os.path.join(pkg_dir, "__init__.py")):
+        if script_dir not in sys.path:
+            sys.path.insert(0, script_dir)
+        return
+    if not os.path.isfile(os.path.join(script_dir, "config.py")):
+        print("FATAL: cannot find magnetic package modules.", file=sys.stderr)
+        sys.exit(2)
+    import shutil, tempfile
+    tmp_root = tempfile.mkdtemp(prefix="magnetic_pkg_")
+    tmp_pkg = os.path.join(tmp_root, "magnetic")
+    os.makedirs(tmp_pkg)
+    for fname in sorted(os.listdir(script_dir)):
+        if fname.endswith(".py") and "_magnetic" not in fname:
+            shutil.copy2(os.path.join(script_dir, fname),
+                         os.path.join(tmp_pkg, fname))
+    sys.path.insert(0, tmp_root)
+    print("  (rebuilt magnetic/ package in %s)" % tmp_pkg)
+
+_setup_magnetic_import()
 
 try:
     import torch
