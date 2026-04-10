@@ -96,8 +96,6 @@ class EdgeBuilder:
         edges = self._build_base(tokens_gpu, vocab_size, device)
         if cfg.use_pmi and edges.numel() > 0:
             edges = self._apply_pmi(edges, freq_gpu, tokens_gpu.numel(), device)
-        if cfg.use_jaccard and edges.numel() > 0:
-            edges = self._apply_jaccard(edges, device)
         return edges
 
     # -------------------------------------------------------------------

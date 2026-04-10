@@ -58,6 +58,24 @@ class ExcitationEngine:
         if self.max_edge_weight < 1e-9:
             self.max_edge_weight = 1.0
 
+        # Degree-ratio per edge: sqrt(min(deg_a, deg_b) / max(deg_a, deg_b)).
+        # Used at INFERENCE TIME ONLY to reduce the influence of
+        # unbalanced relationships (hub ↔ specialist). ALL edges remain
+        # intact for physics training — nothing is deleted.
+        if self.edge_from.numel() > 0 and config.use_jaccard:
+            degree = torch.zeros(self.N, dtype=torch.float32, device=device)
+            degree.scatter_add_(
+                0, self.edge_from,
+                torch.ones(self.edge_from.numel(), dtype=torch.float32, device=device))
+            degree = degree.clamp_min(1.0)
+            da = degree[self.edge_from]
+            db = degree[self.edge_to]
+            self.edge_balance = torch.sqrt(
+                torch.minimum(da, db) / torch.maximum(da, db))
+        else:
+            self.edge_balance = torch.ones(
+                self.edge_from.numel(), dtype=torch.float32, device=device)
+
         # IDF weights: log(V / (freq + 1)), normalised to [0, 1].
         # Common words ("the", "and") get low IDF → low excitation.
         # Rare content words ("england", "king") get high IDF → high
@@ -155,8 +173,12 @@ class ExcitationEngine:
             exc,
             torch.zeros_like(exc))
 
-        # contrib[i] = eff[from[i]] * edge_weight[i]
-        contrib = eff[self.edge_from] * self.edge_weight
+        # contrib[i] = eff[from[i]] * edge_weight[i] * edge_balance[i]
+        # edge_balance suppresses unbalanced relationships at inference
+        # time (e.g. "the" → "king" gets reduced because "the" has 50k
+        # edges while "king" has 500). ALL edges still exist in the
+        # graph for physics — only their INFLUENCE on scoring is reduced.
+        contrib = eff[self.edge_from] * self.edge_weight * self.edge_balance
         out = torch.zeros(self.N, dtype=torch.float32, device=self.device)
         out.scatter_add_(0, self.edge_to, contrib)
 
