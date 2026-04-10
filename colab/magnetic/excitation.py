@@ -58,23 +58,67 @@ class ExcitationEngine:
         if self.max_edge_weight < 1e-9:
             self.max_edge_weight = 1.0
 
-        # Degree-ratio per edge: sqrt(min(deg_a, deg_b) / max(deg_a, deg_b)).
-        # Used at INFERENCE TIME ONLY to reduce the influence of
-        # unbalanced relationships (hub ↔ specialist). ALL edges remain
-        # intact for physics training — nothing is deleted.
-        if self.edge_from.numel() > 0 and config.use_jaccard:
+        # Statistical edge relevance: for each edge, compute how
+        # "exceptional" it is relative to what's normal for its source
+        # and target nodes. Uses Z-score of the edge weight against the
+        # per-node mean/std of outgoing edges, then sigmoid to [0, 1].
+        #
+        # This replaces the crude degree-ratio with the user's proposal:
+        # use actual statistical distribution (mean, std, relative to
+        # global stats) so that:
+        #   - An edge that's much stronger than typical for BOTH endpoints
+        #     gets a high semantic relevance (~1.0)
+        #   - An average edge gets ~0.5
+        #   - A weak/noisy edge gets near 0
+        #
+        # Common words' edges are naturally suppressed because their
+        # per-node mean is high (many similar-weight edges), so no
+        # single edge scores as "exceptional".
+        E = self.edge_from.numel()
+        if E > 0:
+            ew = self.edge_weight.float()
+
+            # Per-node outgoing: mean and std of edge weights.
             degree = torch.zeros(self.N, dtype=torch.float32, device=device)
-            degree.scatter_add_(
-                0, self.edge_from,
-                torch.ones(self.edge_from.numel(), dtype=torch.float32, device=device))
+            degree.scatter_add_(0, self.edge_from, torch.ones(E, dtype=torch.float32, device=device))
             degree = degree.clamp_min(1.0)
-            da = degree[self.edge_from]
-            db = degree[self.edge_to]
-            self.edge_balance = torch.sqrt(
-                torch.minimum(da, db) / torch.maximum(da, db))
+
+            weight_sum = torch.zeros(self.N, dtype=torch.float32, device=device)
+            weight_sum.scatter_add_(0, self.edge_from, ew)
+            node_mean = weight_sum / degree
+
+            weight_sq_sum = torch.zeros(self.N, dtype=torch.float32, device=device)
+            weight_sq_sum.scatter_add_(0, self.edge_from, ew * ew)
+            node_var = (weight_sq_sum / degree) - (node_mean * node_mean)
+            node_std = node_var.clamp_min(0.0).sqrt().clamp_min(1e-6)
+
+            # Z-score for each edge relative to its source node.
+            z_from = (ew - node_mean[self.edge_from]) / node_std[self.edge_from]
+
+            # Z-score relative to target node (same stats but looked up
+            # via edge_to — gives the "how special am I as an incoming
+            # edge for the target" perspective).
+            weight_sum_in = torch.zeros(self.N, dtype=torch.float32, device=device)
+            weight_sum_in.scatter_add_(0, self.edge_to, ew)
+            degree_in = torch.zeros(self.N, dtype=torch.float32, device=device)
+            degree_in.scatter_add_(0, self.edge_to, torch.ones(E, dtype=torch.float32, device=device))
+            degree_in = degree_in.clamp_min(1.0)
+            node_mean_in = weight_sum_in / degree_in
+
+            weight_sq_in = torch.zeros(self.N, dtype=torch.float32, device=device)
+            weight_sq_in.scatter_add_(0, self.edge_to, ew * ew)
+            node_var_in = (weight_sq_in / degree_in) - (node_mean_in * node_mean_in)
+            node_std_in = node_var_in.clamp_min(0.0).sqrt().clamp_min(1e-6)
+
+            z_to = (ew - node_mean_in[self.edge_to]) / node_std_in[self.edge_to]
+
+            # Combined: edge is "special" if above average for BOTH sides.
+            z_combined = (z_from + z_to) * 0.5
+
+            # Sigmoid → [0, 1]. Average edges → 0.5, exceptional → ~1.
+            self.edge_relevance = torch.sigmoid(z_combined)
         else:
-            self.edge_balance = torch.ones(
-                self.edge_from.numel(), dtype=torch.float32, device=device)
+            self.edge_relevance = torch.ones(0, dtype=torch.float32, device=device)
 
         # IDF weights: log(V / (freq + 1)), normalised to [0, 1].
         # Common words ("the", "and") get low IDF → low excitation.
@@ -173,12 +217,13 @@ class ExcitationEngine:
             exc,
             torch.zeros_like(exc))
 
-        # contrib[i] = eff[from[i]] * edge_weight[i] * edge_balance[i]
-        # edge_balance suppresses unbalanced relationships at inference
-        # time (e.g. "the" → "king" gets reduced because "the" has 50k
-        # edges while "king" has 500). ALL edges still exist in the
-        # graph for physics — only their INFLUENCE on scoring is reduced.
-        contrib = eff[self.edge_from] * self.edge_weight * self.edge_balance
+        # contrib[i] = eff[from[i]] * edge_weight[i] * edge_relevance[i]
+        # edge_relevance is a Z-score-based measure of how statistically
+        # exceptional each edge is for BOTH its source and target nodes.
+        # Common-word edges (typical for the node) get ~0.5, exceptional
+        # edges get ~1.0, noise gets ~0. This naturally suppresses the
+        # influence of common words without arbitrary thresholds.
+        contrib = eff[self.edge_from] * self.edge_weight * self.edge_relevance
         out = torch.zeros(self.N, dtype=torch.float32, device=self.device)
         out.scatter_add_(0, self.edge_to, contrib)
 

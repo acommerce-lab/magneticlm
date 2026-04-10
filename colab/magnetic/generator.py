@@ -120,19 +120,25 @@ class MagneticGenerator:
         # Position similarity for candidates.
         pos_score = self._compute_pos_similarity(history)
 
-        # Semantic force from excitation.
-        sem_score = model.excitation.semantic_force()
-
-        # Clamp semantic to [0, max_pos_score] so it doesn't dominate.
-        # This keeps the two supplementary signals on the same scale.
-        pos_max = float(pos_score.max().clamp_min(0.01).item())
-        sem_score = sem_score.clamp(0.0, pos_max)
-
         # Repulsion (for used words).
         repulsion = model.excitation.repulsion
 
-        # Adaptive mixing (same bands as eval_full_wt103).
-        mixed = self._adaptive_mix(kn, pos_score, sem_score)
+        # Base score: KN + position (full band to position).
+        dev = model.device
+        band = torch.where(
+            kn > 0.05,
+            torch.tensor(0.02, device=dev),
+            torch.where(
+                kn > 0.005,
+                torch.tensor(0.06, device=dev),
+                torch.tensor(0.12, device=dev)))
+        kn_w = 1.0 - band
+        base = (kn_w * kn + band * pos_score).clamp(1e-10, 0.999)
+
+        # Semantic force as multiplicative boost.
+        sem = model.excitation.semantic_force()
+        gamma = 0.1
+        mixed = base * (1.0 + gamma * sem).clamp(0.9, 1.5)
         mixed = mixed - repulsion
         mixed = mixed.clamp_min(1e-10)
 
@@ -189,8 +195,16 @@ class MagneticGenerator:
                 torch.tensor(0.06, device=dev),
                 torch.tensor(0.12, device=dev)))
         kn_w = 1.0 - band
-        mixed = (kn_w * kn + band * pos_score).clamp(1e-10, 0.999)
-        return mixed
+        base = (kn_w * kn + band * pos_score).clamp(1e-10, 0.999)
+
+        # Semantic force as MULTIPLICATIVE boost: does not take budget
+        # from position, only nudges the proven KN+position score.
+        # A positive semantic force slightly boosts the word; zero or
+        # negative has no effect. Clamped to prevent extreme distortion.
+        sem = model.excitation.semantic_force()
+        gamma = 0.1  # small: at most ~10% boost
+        mixed = base * (1.0 + gamma * sem).clamp(0.9, 1.5)
+        return mixed.clamp(1e-10, 0.999)
 
     # -------------------------------------------------------------------
     # Adaptive mixing (the proven recipe from eval_full_wt103)
