@@ -356,3 +356,104 @@ python MagneticLMFastRunner.py \
 > structure doesn't apply here — MagneticLM is research code, not
 > part of the e-commerce platform. It lives in `Examples/` for a
 > reason.
+
+---
+
+## Phase 4 — modular rewrite + restored C# inference (2026-04)
+
+### What happened
+
+The original C# Generator.cs had a multi-force inference system:
+excitation + spreading activation + semantic force + repulsion + decay.
+The GPU rewrite (MagneticLMFastRunner.py) dropped ALL of this and
+replaced it with cosine-on-positions. This phase restored the original
+architecture on GPU as a modular Python package (`colab/magnetic/`).
+
+### Architecture: `colab/magnetic/` (14 files, 2700+ lines)
+
+```
+config.py       all hyperparameters in one dataclass
+tokenizer.py    Vocabulary + tokenize
+data.py         WT103 loader
+ngram.py        Modified KN-5 with multi-GPU sharding
+edges.py        semantic edges from ±K window + PMI reweighting
+physics.py      force-directed embedding with configurable dim
+excitation.py   spreading activation + Z-score edge relevance
+model.py        orchestrator
+generator.py    multi-force scoring (KN + position + semantic)
+evaluator.py    WT103 PPL + cloze (in-dist and OOD)
+```
+
+CLI scripts: `train_magnetic.py`, `generate_magnetic.py`, `ood_magnetic.py`
+
+### Key findings from experiments
+
+| Experiment | Result | Conclusion |
+|---|---|---|
+| In-dist cloze (mask middle word of training sentence) | 90% top-1, 100% top-10 | KN dominates; physics smoothing helps |
+| OOD cloze (hand-designed sentences not in WT103) | 24-27% top-10 | Model does NOT generalise; in-dist success was memorisation |
+| Dim sweep (3→16→32→64) | OOD unchanged, PPL worsened | Dimension is not the bottleneck |
+| Position-weight sweep (0.05→0.50) | OOD unchanged | Position layer carries near-zero OOD signal |
+| Excitation + spreading activation | No measurable OOD gain | Edges too weak to carry semantic signal |
+| PMI edge reweighting | Needed to suppress common-word noise | Essential for Z-score to work |
+| Z-score edge relevance + multiplicative semantic | 27% OOD (matched legacy) | Proved the scoring architecture works |
+| Degree-ratio Jaccard (edge deletion at train time) | Destroyed OOD (14%) | Never delete edges during training |
+| Degree-ratio at inference time | 14-16% OOD | Still too aggressive |
+
+### Best configuration found
+
+```bash
+python ood_magnetic.py --train-lines 100000 --physics-iters 100 \
+    --dim 3 --no-pmi   # for OOD: 24% top-10 without PMI
+    # OR
+    --dim 3             # for OOD: 27% top-10 with PMI
+```
+
+Settings: dim=3, PMI=on, Z-score semantic (multiplicative γ=0.1),
+adaptive bands (2%/6%/12%), bidirectional position for cloze.
+
+### What the 14.20 PPL number actually means
+
+The PPL is measured with `eval_full_wt103` which uses KN-5 + position
+cosine similarity + adaptive mixing. Breakdown:
+
+- KN-5 alone (order 3, 1 physics iter): 21.72 PPL
+- + physics (300 iters): 20.94 PPL (Δ = 0.78, small)
+- + higher order (order 4): 16.39 PPL (Δ = 4.55, BIG)
+- + order 5: 14.36 (Δ = 2.03)
+- + 1000 physics iters: 14.20 (Δ = 0.16, tiny)
+
+**The improvement is 93% from n-gram order, 7% from physics.**
+Physics contributes ~0.8 PPL. The headline number is a KN-5 achievement.
+
+### Comparison fairness warning
+
+The 14.20 vs Transformer-XL 16.4 comparison uses DIFFERENT tokenisation.
+This model is word-level; Transformer-XL uses BPE subwords. Word-level
+models have a structural PPL advantage on limited-vocabulary corpora
+because they predict one token per word, not 1-3 subword tokens.
+A fair comparison would require matching tokenisation.
+
+### Why physics looks attractive but delivers little
+
+In 3D space, cosine similarity can distinguish ~20 clusters at best.
+With 123k+ vocabulary, this is far too coarse. The adjacency-based
+edges (±2 window) only capture "appeared next to each other", not
+"appear in similar contexts". The physics is essentially a 3-dimensional
+word2vec trained by force layout instead of gradient descent — with
+3 dimensions instead of the 100-300 that word2vec needs.
+
+The OOD experiments proved this: the position layer contributes nothing
+when KN has no signal. It only helps as a smoothing term on top of
+already-strong KN predictions.
+
+### The real strengths of MagneticLM
+
+1. **Interpretability**: every prediction can be traced to specific
+   n-gram counts, edge weights, and excitation values
+2. **Speed**: 9 seconds to train on 100k lines on a T4
+3. **No training loop**: no gradient descent, no loss function
+4. **Modular**: each component can be swapped independently
+5. **The excitation architecture is sound**: the C# Generator.cs
+   design (excite→spread→score→decay) is correct and waiting for
+   better edges to carry real semantic signal
