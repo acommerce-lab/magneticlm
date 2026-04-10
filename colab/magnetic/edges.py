@@ -293,7 +293,7 @@ class EdgeBuilder:
 
         da = degree[edges.edge_from]
         db = degree[edges.edge_to]
-        ratio = torch.minimum(da, db) / torch.maximum(da, db)
+        ratio = torch.sqrt(torch.minimum(da, db) / torch.maximum(da, db))
 
         new_w = edges.edge_weight * ratio
         mask = new_w >= self.config.semantic_threshold
