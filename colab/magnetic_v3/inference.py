@@ -41,12 +41,22 @@ def _combine_permission_drive(
     s_field: Optional[torch.Tensor],
     cfg,
 ) -> torch.Tensor:
-    """Permission × (1 + Drive).
+    """Permission × (1 + k·Drive) + c·Drive.
 
     Permission gates which words are grammatically/statistically allowed.
     Drive boosts which of those are semantically relevant right now.
-    No drive -> permission-only (function words survive).
-    No permission -> blocked (no hallucinated content words).
+
+    The multiplicative term `P × (1 + k·D)` handles the common case:
+      - No drive -> permission-only (function words survive).
+      - Drive + permission -> content words promoted.
+
+    The additive term `c·D` is the *creative leap* channel:
+      - When a word has near-zero permission but strong drive
+        (e.g. "kingdom" after "the king ruled the", unseen in training),
+        the multiplicative term can't surface it because 0 × anything = 0.
+      - The additive channel lets Drive express itself independently,
+        controlled by creative_strength (default 0.15 — modest to preserve
+        hit@k on common next-tokens).
     """
     permission = (
         cfg.alpha_direct * s_direct
@@ -62,7 +72,8 @@ def _combine_permission_drive(
     if float(drive_sum.item()) > 1e-9:
         drive = drive / drive_sum.clamp(min=1e-9)
 
-    score = permission * (1.0 + cfg.drive_strength * drive)
+    creative = float(getattr(cfg, "creative_strength", 0.0))
+    score = permission * (1.0 + cfg.drive_strength * drive) + creative * drive
     return _normalize(score)
 
 

@@ -127,6 +127,7 @@ class Config:
     # Missing drive -> permission-only (function words still work).
     # Missing permission -> blocked (no hallucination).
     drive_strength: float = 2.0
+    creative_strength: float = 0.15
 
     # observe(): spread activation to semantic neighbors instead of self-echo.
     # Breaks the echo chamber where "the" keeps boosting "the".
