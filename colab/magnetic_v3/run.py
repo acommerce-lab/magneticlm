@@ -8,6 +8,8 @@ Examples:
     python run.py --capacity_method log_inv_freq --active_forces spring,decay
     python run.py --scoring_method stats_only
     python run.py --eval_generation true --gen_samples 5
+    python run.py --use_concepts false  # disable concept layer
+    python run.py --glow_threshold 0.5 --glow_strength 0.2
 """
 
 import argparse
@@ -30,6 +32,7 @@ try:
         ContextualMap,
         make_empty as make_semantic_empty,
         init_from_ppmi,
+        discover_concepts,
         train_parallel,
         InferenceEngine,
         run_full_eval,
@@ -39,10 +42,6 @@ except ImportError:
     parent = os.path.dirname(here)
     if parent not in sys.path:
         sys.path.insert(0, parent)
-    pkg_name = os.path.basename(here)
-    if pkg_name != "magnetic_v3":
-        # running from inside folder with different name — add parent and import
-        sys.path.insert(0, parent)
     from magnetic_v3 import (
         Config, config_from_args, add_cli_args,
         detect_resources,
@@ -51,6 +50,7 @@ except ImportError:
         ContextualMap,
         make_empty as make_semantic_empty,
         init_from_ppmi,
+        discover_concepts,
         train_parallel,
         InferenceEngine,
         run_full_eval,
@@ -121,6 +121,25 @@ def main():
         f"cap_max={stats.capacity.max().item()}"
     )
 
+    # ---- concept layer ----
+    concepts = None
+    if cfg.use_concepts:
+        print("Discovering concepts...")
+        t0 = time.time()
+        concepts = discover_concepts(
+            stats.ppmi_indices[0], stats.ppmi_indices[1], stats.ppmi_values,
+            vocab.size, cfg, resources.primary_device,
+        )
+        n_with = (concepts.primary_concept >= 0).sum().item()
+        print(
+            f"  concepts={concepts.n_concepts}  "
+            f"words_with_concept={n_with}/{vocab.size}  "
+            f"membership_entries={concepts.mem_word.numel()}  "
+            f"in {time.time()-t0:.1f}s"
+        )
+    else:
+        print("Concept layer disabled (--use_concepts false)")
+
     # ---- contextual map ----
     print("Building contextual map...")
     t0 = time.time()
@@ -146,19 +165,22 @@ def main():
     if cfg.run_eval:
         print("Preparing inference engine...")
         engine = InferenceEngine(
-            ctx=ctx, sem=sem, stats=stats, cfg=cfg, device=resources.primary_device
+            ctx=ctx, sem=sem, stats=stats, concepts=concepts,
+            cfg=cfg, device=resources.primary_device,
         )
         engine.prepare()
 
         print("Running evaluation...")
         results = run_full_eval(engine, encoded_valid, vocab, cfg)
 
-        # persist (omit non-serializable tensors)
         serializable = {}
         for k, v in results.items():
             if isinstance(v, dict):
-                serializable[k] = {kk: (vv if not hasattr(vv, "tolist") else vv.tolist())
-                                   for kk, vv in v.items() if kk != "ood_details"}
+                serializable[k] = {
+                    kk: (vv if not hasattr(vv, "tolist") else vv.tolist())
+                    for kk, vv in v.items()
+                    if kk != "ood_details"
+                }
             else:
                 serializable[k] = v
         out_path = os.path.join(cfg.save_dir, "results.json")

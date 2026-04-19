@@ -1,18 +1,21 @@
-"""Evaluation: PPL, hit-rate, OOD cloze, generation."""
+"""Evaluation: PPL, hit-rate, OOD cloze, generation with glow centers.
+
+PPL/hit-rate: stateless (no field) by default, or with field if eval_use_field=True.
+OOD cloze: uses session to feed context words (field accumulates from context).
+Generation: always uses session (field + glow centers active).
+"""
 
 import math
 import time
-from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
 
-from .inference import InferenceEngine
+from .inference import InferenceEngine, InferenceSession
 from .tokenizer import Vocab
 
 
-# Out-of-distribution cloze tests (semantic generalization)
 OOD_CLOZE = [
     ("the king ruled the", "kingdom"),
     ("the queen ruled the", "kingdom"),
@@ -36,21 +39,24 @@ def evaluate_ppl(
     encoded: List[np.ndarray],
     vocab: Vocab,
     max_tokens: int = 200000,
+    use_field: bool = False,
 ) -> Dict[str, float]:
-    """Perplexity on direct next-token prediction."""
-    V = engine.stats.vocab_size
-    device = engine.device
-
     nll = 0.0
     n = 0
     start = time.time()
     for arr in encoded:
         if arr.size < 2:
             continue
+        if use_field:
+            session = engine.create_session()
         for i in range(arr.size - 1):
             cur = int(arr[i])
             tgt = int(arr[i + 1])
-            dist = engine.score_next_token(cur)
+            if use_field:
+                session.observe(cur)
+                dist = session.score_next(cur)
+            else:
+                dist = engine.score_next_token(cur)
             p = float(dist[tgt].item()) + 1e-12
             nll += -math.log(p)
             n += 1
@@ -69,17 +75,23 @@ def evaluate_hit_rate(
     encoded: List[np.ndarray],
     top_k_list: Tuple[int, ...] = (1, 5, 10, 50),
     max_tokens: int = 100000,
+    use_field: bool = False,
 ) -> Dict[str, float]:
-    """Top-k accuracy at predicting next token."""
     hits = {k: 0 for k in top_k_list}
     n = 0
     for arr in encoded:
         if arr.size < 2:
             continue
+        if use_field:
+            session = engine.create_session()
         for i in range(arr.size - 1):
             cur = int(arr[i])
             tgt = int(arr[i + 1])
-            dist = engine.score_next_token(cur)
+            if use_field:
+                session.observe(cur)
+                dist = session.score_next(cur)
+            else:
+                dist = engine.score_next_token(cur)
             _, top_idx = torch.topk(dist, max(top_k_list))
             top_idx = top_idx.tolist()
             for k in top_k_list:
@@ -100,6 +112,7 @@ def evaluate_ood_cloze(
     vocab: Vocab,
     cases: Optional[List[Tuple[str, str]]] = None,
 ) -> Dict[str, float]:
+    """OOD cloze uses session: context words are observed, building field."""
     cases = cases or OOD_CLOZE
     hits = {1: 0, 5: 0, 10: 0}
     total = 0
@@ -108,12 +121,16 @@ def evaluate_ood_cloze(
         toks = vocab.encode_line(context)
         if not toks:
             continue
-        cur = toks[-1]
         tgt_ids = vocab.encode_line(answer)
         if not tgt_ids:
             continue
         tgt = tgt_ids[0]
-        dist = engine.score_next_token(cur)
+
+        session = engine.create_session()
+        for t in toks:
+            session.observe(t)
+        dist = session.score_next(toks[-1])
+
         _, idx = torch.topk(dist, 10)
         top = idx.tolist()
         rank = top.index(tgt) + 1 if tgt in top else None
@@ -125,7 +142,11 @@ def evaluate_ood_cloze(
             if rank <= 10:
                 hits[10] += 1
         total += 1
-        details.append({"context": context, "answer": answer, "rank": rank, "top3": top[:3]})
+        glow = session.get_glow_centers().tolist()
+        details.append({
+            "context": context, "answer": answer,
+            "rank": rank, "top3": top[:3], "glow_centers": len(glow),
+        })
     return {
         "ood_hit@1": hits[1] / max(total, 1),
         "ood_hit@5": hits[5] / max(total, 1),
@@ -143,12 +164,19 @@ def evaluate_generation(
     top_k: int = 40,
     temperature: float = 1.0,
 ) -> List[Dict]:
+    """Generation always uses session (field + glow centers)."""
     out = []
     for prompt in prompts:
         seed = vocab.encode_line(prompt)
-        gen_ids = engine.generate(seed, length=length, top_k=top_k, temperature=temperature)
+        session = engine.create_session()
+        gen_ids = session.generate(seed, length=length, top_k=top_k, temperature=temperature)
         gen_text = " ".join(vocab.itos[i] for i in gen_ids)
-        out.append({"prompt": prompt, "generated": gen_text})
+        glow = session.get_glow_centers().tolist()
+        out.append({
+            "prompt": prompt,
+            "generated": gen_text,
+            "glow_centers_active": len(glow),
+        })
     return out
 
 
@@ -159,23 +187,32 @@ def run_full_eval(
     cfg,
 ) -> Dict:
     results: Dict = {}
+    use_field = getattr(cfg, "eval_use_field", False)
+
     if cfg.eval_ppl:
-        print("  [eval] PPL...")
-        results["ppl"] = evaluate_ppl(engine, encoded_valid, vocab)
+        mode = "with field" if use_field else "stateless"
+        print(f"  [eval] PPL ({mode})...")
+        results["ppl"] = evaluate_ppl(engine, encoded_valid, vocab, use_field=use_field)
         print(f"    PPL = {results['ppl']['ppl']:.2f} on {results['ppl']['n_tokens']} tokens")
+
     if cfg.eval_hit_rate:
-        print("  [eval] hit rate...")
-        results["hit_rate"] = evaluate_hit_rate(engine, encoded_valid)
+        print(f"  [eval] hit rate ({mode})...")
+        results["hit_rate"] = evaluate_hit_rate(engine, encoded_valid, use_field=use_field)
         for k, v in results["hit_rate"].items():
             print(f"    {k} = {v:.4f}")
+
     if cfg.eval_ood_cloze:
-        print("  [eval] OOD cloze...")
+        print("  [eval] OOD cloze (with session + glow)...")
         results["ood"] = evaluate_ood_cloze(engine, vocab)
         print(f"    ood_hit@1 = {results['ood']['ood_hit@1']:.3f}")
         print(f"    ood_hit@5 = {results['ood']['ood_hit@5']:.3f}")
         print(f"    ood_hit@10 = {results['ood']['ood_hit@10']:.3f}")
+        for d in results["ood"].get("ood_details", []):
+            if d.get("rank"):
+                print(f"      [{d['context']!r}] -> rank={d['rank']}  glow={d['glow_centers']}")
+
     if cfg.eval_generation:
-        print("  [eval] generation...")
+        print("  [eval] generation (with session + glow)...")
         prompts = ["the king", "water is", "in the morning", "she said"][: cfg.gen_samples]
         results["generation"] = evaluate_generation(
             engine, vocab, prompts,
@@ -184,5 +221,7 @@ def run_full_eval(
             temperature=cfg.gen_temperature,
         )
         for item in results["generation"]:
-            print(f"    [{item['prompt']!r}] -> {item['generated'][:120]}...")
+            print(f"    [{item['prompt']!r}] glow={item['glow_centers_active']}")
+            print(f"      {item['generated'][:200]}")
+
     return results

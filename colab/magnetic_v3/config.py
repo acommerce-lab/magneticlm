@@ -76,14 +76,34 @@ class Config:
     theta_negative: float = -0.3
 
     # =====================================================================
-    # Inference scoring
-    #   - "mixture": alpha*P_concept + beta*P_ppmi + gamma*P_kn
-    #   - "concept_only", "stats_only"
+    # Concept layer (many-to-many word <-> concept)
+    # =====================================================================
+    use_concepts: bool = True
+    concept_ppmi_threshold: float = 2.0
+    concept_min_size: int = 3
+    concept_max_size: int = 500
+
+    # =====================================================================
+    # Activation field (persistent across generation steps)
+    #   Glow centers = concepts with activation > glow_threshold
+    #   They inject activation into member words each step
+    # =====================================================================
+    field_decay: float = 0.05
+    concept_decay: float = 0.03
+    glow_threshold: float = 0.3
+    glow_strength: float = 0.3
+
+    # =====================================================================
+    # Inference scoring (5-component mixture)
+    #   S = a1*S_direct + a2*S_adopt + a3*S_concept + a4*S_field + a5*S_stats
+    #   scoring_method: "mixture", "concept_only", "stats_only"
     # =====================================================================
     scoring_method: str = "mixture"
-    alpha_concept: float = 0.6
-    beta_ppmi: float = 0.2
-    gamma_kn: float = 0.2
+    alpha_direct: float = 0.25
+    alpha_adopt: float = 0.15
+    alpha_concept: float = 0.15
+    alpha_field: float = 0.20
+    alpha_stats: float = 0.25
     kn_discount: float = 0.75
 
     # Adoption: borrow children from semantic neighbors
@@ -94,6 +114,7 @@ class Config:
     spreading_iters: int = 5
     spreading_damping: float = 0.85
     spreading_top_k: int = 64
+    spreading_concept_relay: float = 0.5
 
     # =====================================================================
     # Training
@@ -110,6 +131,7 @@ class Config:
     eval_hit_rate: bool = True
     eval_ood_cloze: bool = True
     eval_generation: bool = False
+    eval_use_field: bool = False
     gen_length: int = 50
     gen_samples: int = 5
     gen_top_k: int = 40
