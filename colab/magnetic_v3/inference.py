@@ -101,6 +101,7 @@ class InferenceEngine:
     sem_sparse: Optional[torch.Tensor] = None
     node_stats: Optional[Dict[str, torch.Tensor]] = None
     idf: Optional[torch.Tensor] = None
+    _nbr_cache: Optional[Dict[int, List]] = None
 
     def _mask_unk(self, dist: torch.Tensor) -> torch.Tensor:
         if self.unk_id is None or self.unk_id < 0:
@@ -121,6 +122,19 @@ class InferenceEngine:
         # Blend: idf_strength=0 -> all ones (no effect), =1 -> full IDF
         s = float(getattr(self.cfg, "idf_strength", 0.5))
         self.idf = (1.0 - s) + s * raw_idf
+
+        max_k = max(
+            self.cfg.adoption_neighbors,
+            getattr(self.cfg, "observe_spread_k", 16),
+        )
+        self._nbr_cache = {}
+        for a in range(V):
+            if self.sem.adjacency[a]:
+                self._nbr_cache[a] = sem_neighbors(self.sem, a, top_k=max_k)
+
+    def cached_neighbors(self, node_id: int, top_k: int) -> List:
+        nbrs = self._nbr_cache.get(node_id, [])
+        return nbrs[:top_k] if top_k > 0 and len(nbrs) > top_k else nbrs
 
     def create_session(self) -> "InferenceSession":
         return InferenceSession(self)
@@ -188,7 +202,7 @@ class InferenceEngine:
         V = self.stats.vocab_size
         device = self.device
         cfg = self.cfg
-        nbrs = sem_neighbors(self.sem, current, top_k=cfg.adoption_neighbors)
+        nbrs = self.cached_neighbors(current, cfg.adoption_neighbors)
         scores = torch.zeros(V, dtype=torch.float32, device=device)
         for n_id, n_weight in nbrs:
             if n_weight < cfg.adoption_min_weight:
@@ -279,7 +293,7 @@ class InferenceSession:
         cfg = self.engine.cfg
         self.word_field[token_id] += cfg.observe_self_strength
 
-        nbrs = sem_neighbors(self.engine.sem, token_id, top_k=cfg.observe_spread_k)
+        nbrs = self.engine.cached_neighbors(token_id, cfg.observe_spread_k)
         if nbrs:
             idx = torch.tensor(
                 [n_id for n_id, _ in nbrs], dtype=torch.int64, device=self.device
