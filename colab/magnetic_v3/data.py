@@ -64,8 +64,20 @@ def _hf_download_wikitext(data_dir: str) -> Optional[Tuple[str, str]]:
     Uses the same proven pattern as MagneticLMFastRunner.ensure_wt103:
       - Salesforce/wikitext (the current canonical repo)
       - strip whitespace, skip header lines starting with "="
+    Writes to an absolute path under /kaggle/working if available so data
+    persists even when the notebook cwd drifts between cells.
     """
+    if os.path.isdir("/kaggle/working"):
+        stable_dir = "/kaggle/working/data/wikitext-103"
+    else:
+        stable_dir = os.path.join(data_dir, "wikitext-103")
+    # Also write to data_dir if different, so both paths work
     target_dir = os.path.join(data_dir, "wikitext-103")
+    # Check stable location first
+    stable_train = os.path.join(stable_dir, "wiki.train.tokens")
+    stable_valid = os.path.join(stable_dir, "wiki.valid.tokens")
+    if os.path.exists(stable_train) and os.path.exists(stable_valid):
+        return stable_train, stable_valid
     os.makedirs(target_dir, exist_ok=True)
     train_path = os.path.join(target_dir, "wiki.train.tokens")
     valid_path = os.path.join(target_dir, "wiki.valid.tokens")
@@ -85,7 +97,18 @@ def _hf_download_wikitext(data_dir: str) -> Optional[Tuple[str, str]]:
         print(f"  [hf] download failed: {e}")
         return None
 
-    for split, path in (("train", train_path), ("validation", valid_path)):
+    # Write to both stable_dir and target_dir (they may be the same)
+    write_pairs = [("train", train_path), ("validation", valid_path)]
+    if stable_dir != target_dir:
+        os.makedirs(stable_dir, exist_ok=True)
+        write_pairs += [
+            ("train", stable_train),
+            ("validation", stable_valid),
+        ]
+    for split, path in write_pairs:
+        if os.path.exists(path):
+            continue
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             for item in ds[split]:
                 t = item["text"].strip()
@@ -97,20 +120,26 @@ def _hf_download_wikitext(data_dir: str) -> Optional[Tuple[str, str]]:
 
 def _locate_wikitext103(data_dir: str) -> Tuple[str, str]:
     """Return (train_path, valid_path)."""
-    direct_train = [
-        os.path.join(data_dir, name) for name in _TRAIN_NAMES
-    ] + [
-        os.path.join(data_dir, sub, name)
-        for sub in ("wikitext-103", "wikitext-103-raw", "wikitext-103-v1", "wikitext-103-raw-v1")
-        for name in _TRAIN_NAMES
-    ]
-    direct_valid = [
-        os.path.join(data_dir, name) for name in _VALID_NAMES
-    ] + [
-        os.path.join(data_dir, sub, name)
-        for sub in ("wikitext-103", "wikitext-103-raw", "wikitext-103-v1", "wikitext-103-raw-v1")
-        for name in _VALID_NAMES
-    ]
+    # Check both the user-specified data_dir and common absolute paths where
+    # a previous run may have written the files (Kaggle cwd can drift).
+    search_dirs = [data_dir]
+    for extra in ("/kaggle/working/data", "/kaggle/working", "/content/data"):
+        if extra not in search_dirs:
+            search_dirs.append(extra)
+
+    direct_train = []
+    direct_valid = []
+    for d in search_dirs:
+        for name in _TRAIN_NAMES:
+            direct_train.append(os.path.join(d, name))
+        for sub in ("wikitext-103", "wikitext-103-raw", "wikitext-103-v1", "wikitext-103-raw-v1"):
+            for name in _TRAIN_NAMES:
+                direct_train.append(os.path.join(d, sub, name))
+        for name in _VALID_NAMES:
+            direct_valid.append(os.path.join(d, name))
+        for sub in ("wikitext-103", "wikitext-103-raw", "wikitext-103-v1", "wikitext-103-raw-v1"):
+            for name in _VALID_NAMES:
+                direct_valid.append(os.path.join(d, sub, name))
 
     tr = _try_paths(*direct_train)
     va = _try_paths(*direct_valid)
