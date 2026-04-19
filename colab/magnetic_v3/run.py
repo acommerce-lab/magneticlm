@@ -191,6 +191,7 @@ def main():
         engine = InferenceEngine(
             ctx=ctx, sem=sem, stats=stats, concepts=concepts,
             cfg=cfg, device=resources.primary_device,
+            unk_id=vocab.unk_id,
         )
         engine.prepare()
 

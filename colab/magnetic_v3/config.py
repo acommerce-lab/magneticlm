@@ -117,7 +117,7 @@ class Config:
     alpha_concept: float = 0.15
     alpha_field: float = 0.20
     alpha_stats: float = 0.25
-    idf_strength: float = 0.5  # 0=no IDF, 1=full IDF; blended as (1-s) + s*idf
+    idf_strength: float = 0.75  # 0=no IDF, 1=full IDF; blended as (1-s) + s*idf
     kn_discount: float = 0.75
 
     # Permission × (1 + Drive) architecture

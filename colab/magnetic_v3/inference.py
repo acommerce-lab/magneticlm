@@ -74,9 +74,17 @@ class InferenceEngine:
     concepts: Optional[ConceptLayer]
     cfg: "any"
     device: torch.device
+    unk_id: int = -1
     sem_sparse: Optional[torch.Tensor] = None
     node_stats: Optional[Dict[str, torch.Tensor]] = None
     idf: Optional[torch.Tensor] = None
+
+    def _mask_unk(self, dist: torch.Tensor) -> torch.Tensor:
+        if self.unk_id is None or self.unk_id < 0:
+            return dist
+        dist = dist.clone()
+        dist[self.unk_id] = 0.0
+        return dist / dist.sum().clamp(min=1e-9)
 
     def prepare(self):
         self.sem_sparse = to_sparse_tensor(self.sem, self.device)
@@ -115,24 +123,22 @@ class InferenceEngine:
         s_stats = self._stats_scores(current)
 
         if cfg.scoring_method == "stats_only":
-            return s_stats
+            return self._mask_unk(s_stats)
         if cfg.scoring_method == "concept_only":
             mix = s_direct + s_adopt + s_concept
-            s = mix.sum().clamp(min=1e-9)
-            return mix / s
+            return self._mask_unk(_normalize(mix))
         if cfg.scoring_method == "permission_drive":
-            return _combine_permission_drive(
+            return self._mask_unk(_combine_permission_drive(
                 s_direct, s_adopt, s_stats, s_concept,
                 s_field=None, cfg=cfg,
-            )
+            ))
         mix = (
             cfg.alpha_direct * s_direct
             + cfg.alpha_adopt * s_adopt
             + cfg.alpha_concept * s_concept
             + cfg.alpha_stats * s_stats
         )
-        s = mix.sum().clamp(min=1e-9)
-        return mix / s
+        return self._mask_unk(_normalize(mix))
 
     # ------------------------------------------------------------------
     # Shared scoring components
@@ -306,16 +312,17 @@ class InferenceSession:
         if float(sf_sum.item()) > 1e-9:
             s_field = s_field / sf_sum.clamp(min=1e-9)
 
+        mask = eng._mask_unk
         if cfg.scoring_method == "stats_only":
-            return s_stats
+            return mask(s_stats)
         if cfg.scoring_method == "concept_only":
             mix = s_direct + s_adopt + s_concept + cfg.alpha_field * s_field
-            return _normalize(mix)
+            return mask(_normalize(mix))
         if cfg.scoring_method == "permission_drive":
-            return _combine_permission_drive(
+            return mask(_combine_permission_drive(
                 s_direct, s_adopt, s_stats, s_concept,
                 s_field=s_field, cfg=cfg,
-            )
+            ))
         # Legacy linear mixture
         mix = (
             cfg.alpha_direct * s_direct
@@ -324,7 +331,7 @@ class InferenceSession:
             + cfg.alpha_field * s_field
             + cfg.alpha_stats * s_stats
         )
-        return _normalize(mix)
+        return mask(_normalize(mix))
 
     def generate(
         self,
