@@ -111,7 +111,7 @@ class Config:
     #   S = a1*S_direct + a2*S_adopt + a3*S_concept + a4*S_field + a5*S_stats
     #   scoring_method: "mixture", "concept_only", "stats_only"
     # =====================================================================
-    scoring_method: str = "mixture"
+    scoring_method: str = "permission_drive"
     alpha_direct: float = 0.25
     alpha_adopt: float = 0.15
     alpha_concept: float = 0.15
@@ -119,6 +119,20 @@ class Config:
     alpha_stats: float = 0.25
     idf_strength: float = 0.5  # 0=no IDF, 1=full IDF; blended as (1-s) + s*idf
     kn_discount: float = 0.75
+
+    # Permission × (1 + Drive) architecture
+    #   Permission = frequentist layer (direct + adopt + stats), says "what's allowed"
+    #   Drive      = semantic layer (concept + field), says "what's relevant"
+    #   Final score = Permission × (1 + drive_strength × Drive)
+    # Missing drive -> permission-only (function words still work).
+    # Missing permission -> blocked (no hallucination).
+    drive_strength: float = 2.0
+
+    # observe(): spread activation to semantic neighbors instead of self-echo.
+    # Breaks the echo chamber where "the" keeps boosting "the".
+    observe_self_strength: float = 0.2
+    observe_neighbor_strength: float = 1.0
+    observe_spread_k: int = 16
 
     # Adoption: borrow children from semantic neighbors
     adoption_neighbors: int = 10

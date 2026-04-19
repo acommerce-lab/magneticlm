@@ -29,6 +29,43 @@ from .concepts import ConceptLayer
 from .spreading import spread, spread_with_concepts, compute_node_thresholds
 
 
+def _normalize(x: torch.Tensor) -> torch.Tensor:
+    return x / x.sum().clamp(min=1e-9)
+
+
+def _combine_permission_drive(
+    s_direct: torch.Tensor,
+    s_adopt: torch.Tensor,
+    s_stats: torch.Tensor,
+    s_concept: torch.Tensor,
+    s_field: Optional[torch.Tensor],
+    cfg,
+) -> torch.Tensor:
+    """Permission × (1 + Drive).
+
+    Permission gates which words are grammatically/statistically allowed.
+    Drive boosts which of those are semantically relevant right now.
+    No drive -> permission-only (function words survive).
+    No permission -> blocked (no hallucinated content words).
+    """
+    permission = (
+        cfg.alpha_direct * s_direct
+        + cfg.alpha_adopt * s_adopt
+        + cfg.alpha_stats * s_stats
+    )
+    permission = _normalize(permission)
+
+    drive = cfg.alpha_concept * s_concept
+    if s_field is not None:
+        drive = drive + cfg.alpha_field * s_field
+    drive_sum = drive.sum()
+    if float(drive_sum.item()) > 1e-9:
+        drive = drive / drive_sum.clamp(min=1e-9)
+
+    score = permission * (1.0 + cfg.drive_strength * drive)
+    return _normalize(score)
+
+
 @dataclass
 class InferenceEngine:
     ctx: ContextualMap
@@ -79,15 +116,21 @@ class InferenceEngine:
 
         if cfg.scoring_method == "stats_only":
             return s_stats
-        elif cfg.scoring_method == "concept_only":
+        if cfg.scoring_method == "concept_only":
             mix = s_direct + s_adopt + s_concept
-        else:
-            mix = (
-                cfg.alpha_direct * s_direct
-                + cfg.alpha_adopt * s_adopt
-                + cfg.alpha_concept * s_concept
-                + cfg.alpha_stats * s_stats
+            s = mix.sum().clamp(min=1e-9)
+            return mix / s
+        if cfg.scoring_method == "permission_drive":
+            return _combine_permission_drive(
+                s_direct, s_adopt, s_stats, s_concept,
+                s_field=None, cfg=cfg,
             )
+        mix = (
+            cfg.alpha_direct * s_direct
+            + cfg.alpha_adopt * s_adopt
+            + cfg.alpha_concept * s_concept
+            + cfg.alpha_stats * s_stats
+        )
         s = mix.sum().clamp(min=1e-9)
         return mix / s
 
@@ -197,8 +240,27 @@ class InferenceSession:
         self.concept_field = torch.zeros(C, dtype=torch.float32, device=self.device)
 
     def observe(self, token_id: int):
-        """Register a token (from seed or generated output)."""
-        self.word_field[token_id] += 1.0
+        """Register a token: spread activation to semantic neighbors.
+
+        Instead of self-echo (word_field[token] += 1), we deposit a small amount
+        on the token itself and a larger amount on its semantic neighbors.
+        This means observing "king" activates {crown, throne, kingdom},
+        not "king" itself — breaking the repetition echo chamber.
+        """
+        cfg = self.engine.cfg
+        self.word_field[token_id] += cfg.observe_self_strength
+
+        nbrs = sem_neighbors(self.engine.sem, token_id, top_k=cfg.observe_spread_k)
+        if nbrs:
+            idx = torch.tensor(
+                [n_id for n_id, _ in nbrs], dtype=torch.int64, device=self.device
+            )
+            w = torch.tensor(
+                [weight for _, weight in nbrs], dtype=torch.float32, device=self.device
+            )
+            w = w.clamp(min=0.0) * cfg.observe_neighbor_strength
+            self.word_field.scatter_add_(0, idx, w)
+
         concepts = self.engine.concepts
         if concepts and concepts.n_concepts > 0:
             delta = torch.zeros_like(self.word_field)
@@ -220,51 +282,49 @@ class InferenceSession:
                 self.word_field += injection
 
     def score_next(self, current: int) -> torch.Tensor:
-        """Full 5-component scoring with field influence."""
+        """Full scoring with field influence via Permission × (1 + Drive)."""
         self._step()
         eng = self.engine
         cfg = eng.cfg
         V = eng.stats.vocab_size
 
-        # Modulation: field-based boost for all candidates
-        field_mod = 1.0 + self.word_field.clamp(min=0.0)
+        # Permission components (frequentist): no field multiplication.
+        # Field belongs to Drive, so it boosts semantically relevant words
+        # without inflating whatever token was just spoken.
+        s_direct = eng._ctx_scores(current)
+        s_adopt = eng._adoption_scores(current)
+        s_stats = eng._stats_scores(current)
 
-        # S_direct: contextual children × field modulation
-        s_direct = eng._ctx_scores(current) * field_mod
-
-        # S_adopt: adopted children × field modulation
-        s_adopt = eng._adoption_scores(current) * field_mod
-
-        # S_concept: spreading through semantic + concept relay, seeded with field
+        # Drive components (semantic): concept spreading + persistent field.
         if cfg.alpha_concept > 0 and eng.sem_sparse is not None:
             s_concept = eng._concept_spreading(current, field_seed=self.word_field)
         else:
             s_concept = torch.zeros(V, dtype=torch.float32, device=self.device)
 
-        # S_field: persistent activation (distant glow center contribution)
         s_field = self.word_field.clamp(min=0.0)
-        sf_sum = s_field.sum().clamp(min=1e-9)
-        s_field = s_field / sf_sum
+        sf_sum = s_field.sum()
+        if float(sf_sum.item()) > 1e-9:
+            s_field = s_field / sf_sum.clamp(min=1e-9)
 
-        # S_stats: statistical baseline
-        s_stats = eng._stats_scores(current)
-
-        # Combine
         if cfg.scoring_method == "stats_only":
             return s_stats
-        elif cfg.scoring_method == "concept_only":
+        if cfg.scoring_method == "concept_only":
             mix = s_direct + s_adopt + s_concept + cfg.alpha_field * s_field
-        else:
-            mix = (
-                cfg.alpha_direct * s_direct
-                + cfg.alpha_adopt * s_adopt
-                + cfg.alpha_concept * s_concept
-                + cfg.alpha_field * s_field
-                + cfg.alpha_stats * s_stats
+            return _normalize(mix)
+        if cfg.scoring_method == "permission_drive":
+            return _combine_permission_drive(
+                s_direct, s_adopt, s_stats, s_concept,
+                s_field=s_field, cfg=cfg,
             )
-
-        s = mix.sum().clamp(min=1e-9)
-        return mix / s
+        # Legacy linear mixture
+        mix = (
+            cfg.alpha_direct * s_direct
+            + cfg.alpha_adopt * s_adopt
+            + cfg.alpha_concept * s_concept
+            + cfg.alpha_field * s_field
+            + cfg.alpha_stats * s_stats
+        )
+        return _normalize(mix)
 
     def generate(
         self,
