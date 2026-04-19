@@ -1,60 +1,84 @@
 """CLI runner for magnetic_v3.
 
-Handles flat Colab/Kaggle layouts: tries sibling-import first, then
-falls back to absolute import of the package folder.
+Handles flat layouts with any folder name (Colab/Kaggle):
+  - If the files live inside a folder named `magnetic_v3/`, regular import works.
+  - Otherwise (e.g. `/kaggle/input/.../codev3/`), we bootstrap `magnetic_v3`
+    as an in-memory package pointing to the current directory so that
+    relative imports like `from .concepts import X` keep working.
 
 Examples:
     python run.py --max_train_lines 10000 --max_valid_lines 500
     python run.py --capacity_method log_inv_freq --active_forces spring,decay
     python run.py --scoring_method stats_only
     python run.py --eval_generation true --gen_samples 5
-    python run.py --use_concepts false  # disable concept layer
+    python run.py --use_concepts false
     python run.py --glow_threshold 0.5 --glow_strength 0.2
 """
 
 import argparse
+import importlib.util
 import json
 import os
 import random
 import sys
 import time
 
+# -- Bootstrap the magnetic_v3 package regardless of folder name --------------
+
+def _bootstrap_package():
+    here = os.path.dirname(os.path.abspath(__file__))
+    sys.dont_write_bytecode = True  # many Kaggle inputs are read-only
+
+    # Case 1: importable as-is (installed, or parent dir on path, etc.)
+    try:
+        import magnetic_v3  # noqa: F401
+        return
+    except ImportError:
+        pass
+
+    # Case 2: we're inside a folder called `magnetic_v3/` — add parent to path
+    if os.path.basename(here) == "magnetic_v3":
+        parent = os.path.dirname(here)
+        if parent not in sys.path:
+            sys.path.insert(0, parent)
+        import magnetic_v3  # noqa: F401
+        return
+
+    # Case 3: flat layout with arbitrary folder name. Create an in-memory
+    # `magnetic_v3` package whose submodule search path is the current dir.
+    init_path = os.path.join(here, "__init__.py")
+    if not os.path.exists(init_path):
+        raise ImportError(
+            f"Cannot bootstrap magnetic_v3: __init__.py missing in {here}"
+        )
+    spec = importlib.util.spec_from_file_location(
+        "magnetic_v3",
+        init_path,
+        submodule_search_locations=[here],
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["magnetic_v3"] = module
+    spec.loader.exec_module(module)
+
+
+_bootstrap_package()
+
 import numpy as np
 import torch
 
-# ---- flat-layout import fallback -------------------------------------------
-try:
-    from magnetic_v3 import (
-        Config, config_from_args, add_cli_args,
-        detect_resources,
-        build_vocab, encode_stream, load_dataset,
-        build_statistics,
-        ContextualMap,
-        make_empty as make_semantic_empty,
-        init_from_ppmi,
-        discover_concepts,
-        train_parallel,
-        InferenceEngine,
-        run_full_eval,
-    )
-except ImportError:
-    here = os.path.dirname(os.path.abspath(__file__))
-    parent = os.path.dirname(here)
-    if parent not in sys.path:
-        sys.path.insert(0, parent)
-    from magnetic_v3 import (
-        Config, config_from_args, add_cli_args,
-        detect_resources,
-        build_vocab, encode_stream, load_dataset,
-        build_statistics,
-        ContextualMap,
-        make_empty as make_semantic_empty,
-        init_from_ppmi,
-        discover_concepts,
-        train_parallel,
-        InferenceEngine,
-        run_full_eval,
-    )
+from magnetic_v3 import (
+    Config, config_from_args, add_cli_args,
+    detect_resources,
+    build_vocab, encode_stream, load_dataset,
+    build_statistics,
+    ContextualMap,
+    make_empty as make_semantic_empty,
+    init_from_ppmi,
+    discover_concepts,
+    train_parallel,
+    InferenceEngine,
+    run_full_eval,
+)
 
 
 def set_seed(seed: int):
