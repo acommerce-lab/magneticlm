@@ -1,6 +1,23 @@
+"""Dataset loading with robust auto-discovery + HuggingFace fallback.
+
+Search strategy for wikitext-103:
+  1. Direct paths under --data_dir (wiki.train.tokens, wikitext-103/, ...)
+  2. Recursive glob under /kaggle/input, /content, /workspace, /data
+     accepting wiki.train.* (.tokens, .raw, .txt) names
+  3. HuggingFace `datasets` download as last resort (cached under data_dir)
+
+On miss, prints what directories actually exist under the search roots so
+the user can see what's attached to their notebook.
+"""
+
 import glob
 import os
 from typing import Iterator, List, Optional, Tuple
+
+
+_SEARCH_ROOTS = ("/kaggle/input", "/content", "/workspace", "/data")
+_TRAIN_NAMES = ("wiki.train.tokens", "wiki.train.raw", "wiki.train.txt")
+_VALID_NAMES = ("wiki.valid.tokens", "wiki.valid.raw", "wiki.valid.txt")
 
 
 def _try_paths(*paths) -> Optional[str]:
@@ -10,35 +27,83 @@ def _try_paths(*paths) -> Optional[str]:
     return None
 
 
-# Directories we scan recursively for wiki.{train,valid}.tokens when a direct
-# path miss. Kaggle datasets mount under /kaggle/input/<slug>/..., Colab under
-# /content/..., and local layouts under data_dir.
-_SEARCH_ROOTS = ("/kaggle/input", "/content", "/workspace", "/data")
-
-
-def _glob_first(root: str, filename: str) -> Optional[str]:
+def _glob_first(root: str, filenames) -> Optional[str]:
+    """Recursively find the first match for any of `filenames` under `root`."""
     if not os.path.isdir(root):
         return None
-    # Cap depth to avoid scanning huge trees; wikitext nests at most a few deep.
-    for depth in range(1, 6):
-        pattern = os.path.join(root, *(["*"] * depth), filename)
-        for hit in glob.glob(pattern):
-            if os.path.isfile(hit):
-                return hit
+    for depth in range(1, 7):
+        for name in filenames:
+            pattern = os.path.join(root, *(["*"] * depth), name)
+            for hit in glob.glob(pattern):
+                if os.path.isfile(hit):
+                    return hit
     return None
 
 
+def _list_available_dirs() -> str:
+    """Human-readable listing of what's actually mounted under search roots."""
+    lines = []
+    for root in _SEARCH_ROOTS:
+        if not os.path.isdir(root):
+            continue
+        try:
+            entries = sorted(os.listdir(root))
+        except OSError as e:
+            lines.append(f"  {root}: <unreadable: {e}>")
+            continue
+        if not entries:
+            lines.append(f"  {root}: <empty>")
+        else:
+            lines.append(f"  {root}: {entries}")
+    return "\n".join(lines) if lines else "  (none of /kaggle/input, /content, /workspace, /data exist)"
+
+
+def _hf_download_wikitext(data_dir: str) -> Optional[Tuple[str, str]]:
+    """Fallback: fetch wikitext-103 via HuggingFace datasets, write .tokens files."""
+    try:
+        from datasets import load_dataset as _hf_load
+    except ImportError:
+        return None
+
+    target_dir = os.path.join(data_dir, "wikitext-103")
+    train_path = os.path.join(target_dir, "wiki.train.tokens")
+    valid_path = os.path.join(target_dir, "wiki.valid.tokens")
+    if os.path.exists(train_path) and os.path.exists(valid_path):
+        return train_path, valid_path
+
+    print("  [hf] downloading wikitext-103 via HuggingFace datasets...")
+    try:
+        ds = _hf_load("wikitext", "wikitext-103-v1")
+    except Exception as e:
+        print(f"  [hf] download failed: {e}")
+        return None
+
+    os.makedirs(target_dir, exist_ok=True)
+    for split, path in (("train", train_path), ("validation", valid_path)):
+        with open(path, "w", encoding="utf-8") as f:
+            for row in ds[split]:
+                text = row["text"]
+                if text:
+                    f.write(text if text.endswith("\n") else text + "\n")
+    print(f"  [hf] wrote {train_path} and {valid_path}")
+    return train_path, valid_path
+
+
 def _locate_wikitext103(data_dir: str) -> Tuple[str, str]:
-    """Return (train_path, valid_path) searching common Colab/Kaggle layouts."""
+    """Return (train_path, valid_path)."""
     direct_train = [
-        os.path.join(data_dir, "wiki.train.tokens"),
-        os.path.join(data_dir, "wikitext-103/wiki.train.tokens"),
-        os.path.join(data_dir, "wikitext-103-raw/wiki.train.tokens"),
+        os.path.join(data_dir, name) for name in _TRAIN_NAMES
+    ] + [
+        os.path.join(data_dir, sub, name)
+        for sub in ("wikitext-103", "wikitext-103-raw", "wikitext-103-v1", "wikitext-103-raw-v1")
+        for name in _TRAIN_NAMES
     ]
     direct_valid = [
-        os.path.join(data_dir, "wiki.valid.tokens"),
-        os.path.join(data_dir, "wikitext-103/wiki.valid.tokens"),
-        os.path.join(data_dir, "wikitext-103-raw/wiki.valid.tokens"),
+        os.path.join(data_dir, name) for name in _VALID_NAMES
+    ] + [
+        os.path.join(data_dir, sub, name)
+        for sub in ("wikitext-103", "wikitext-103-raw", "wikitext-103-v1", "wikitext-103-raw-v1")
+        for name in _VALID_NAMES
     ]
 
     tr = _try_paths(*direct_train)
@@ -46,32 +111,42 @@ def _locate_wikitext103(data_dir: str) -> Tuple[str, str]:
 
     if not tr:
         for root in _SEARCH_ROOTS:
-            tr = _glob_first(root, "wiki.train.tokens")
+            tr = _glob_first(root, _TRAIN_NAMES)
             if tr:
                 break
     if not va:
         for root in _SEARCH_ROOTS:
-            va = _glob_first(root, "wiki.valid.tokens")
+            va = _glob_first(root, _VALID_NAMES)
             if va:
                 break
 
-    # As a last resort, if we found train, look for valid next to it.
     if tr and not va:
-        sibling = os.path.join(os.path.dirname(tr), "wiki.valid.tokens")
-        if os.path.exists(sibling):
-            va = sibling
+        base = os.path.dirname(tr)
+        for name in _VALID_NAMES:
+            cand = os.path.join(base, name)
+            if os.path.exists(cand):
+                va = cand
+                break
 
-    if not tr:
+    # Last resort: HuggingFace download
+    if not tr or not va:
+        hf = _hf_download_wikitext(data_dir)
+        if hf is not None:
+            tr, va = hf
+
+    if not tr or not va:
+        listing = _list_available_dirs()
         raise FileNotFoundError(
-            "wiki.train.tokens not found. Checked direct paths "
-            f"{direct_train} and recursively scanned {list(_SEARCH_ROOTS)}. "
-            "Pass --data_dir /path/to/folder-containing-wiki.train.tokens."
-        )
-    if not va:
-        raise FileNotFoundError(
-            "wiki.valid.tokens not found. Checked direct paths "
-            f"{direct_valid} and recursively scanned {list(_SEARCH_ROOTS)}. "
-            "Pass --data_dir /path/to/folder-containing-wiki.valid.tokens."
+            "wikitext-103 files not found.\n"
+            f"  tried direct paths under --data_dir={data_dir}\n"
+            f"  recursively scanned: {list(_SEARCH_ROOTS)}\n"
+            f"  HuggingFace fallback: "
+            f"{'unavailable (no `datasets` pkg or no internet)' if not tr else 'ok'}\n"
+            f"What is actually mounted:\n{listing}\n"
+            "Fix: either\n"
+            "  (a) attach a wikitext-103 Kaggle dataset to your notebook, or\n"
+            "  (b) pass --data_dir /kaggle/input/<your-wikitext-slug>, or\n"
+            "  (c) enable internet in the notebook so HuggingFace download works."
         )
     return tr, va
 
