@@ -39,6 +39,10 @@ def threshold_auto(signal: torch.Tensor, weights: torch.Tensor, cfg, node_stats=
     sd = node_stats["sd"]
     theta_p = mu + sd
     theta_n = mu - sd
+    src = node_stats.get("src")
+    if src is not None:
+        theta_p = theta_p[src]
+        theta_n = theta_n[src]
     pos = (weights > theta_p).to(signal.dtype)
     neg = (weights < theta_n).to(signal.dtype)
     return signal * (pos * weights.clamp(min=0) - neg * weights.clamp(max=0).abs())

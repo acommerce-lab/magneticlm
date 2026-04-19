@@ -53,6 +53,9 @@ def spread(
     a = idx[0]
     b = idx[1]
 
+    if node_stats is not None:
+        node_stats["src"] = a
+
     for _ in range(cfg.spreading_iters):
         in_sig = activation[a]
         out_sig = transfer(in_sig, val, cfg, node_stats)
@@ -87,6 +90,9 @@ def spread_with_concepts(
     val = sp.values()
     a = idx[0]
     b = idx[1]
+
+    if node_stats is not None:
+        node_stats["src"] = a
 
     relay_strength = getattr(cfg, "spreading_concept_relay", 0.5)
     has_concepts = concepts is not None and concepts.n_concepts > 0
