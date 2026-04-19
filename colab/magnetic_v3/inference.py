@@ -123,22 +123,22 @@ class InferenceEngine:
         s_stats = self._stats_scores(current)
 
         if cfg.scoring_method == "stats_only":
-            return self._mask_unk(s_stats)
+            return s_stats
         if cfg.scoring_method == "concept_only":
             mix = s_direct + s_adopt + s_concept
-            return self._mask_unk(_normalize(mix))
+            return _normalize(mix)
         if cfg.scoring_method == "permission_drive":
-            return self._mask_unk(_combine_permission_drive(
+            return _combine_permission_drive(
                 s_direct, s_adopt, s_stats, s_concept,
                 s_field=None, cfg=cfg,
-            ))
+            )
         mix = (
             cfg.alpha_direct * s_direct
             + cfg.alpha_adopt * s_adopt
             + cfg.alpha_concept * s_concept
             + cfg.alpha_stats * s_stats
         )
-        return self._mask_unk(_normalize(mix))
+        return _normalize(mix)
 
     # ------------------------------------------------------------------
     # Shared scoring components
@@ -312,17 +312,16 @@ class InferenceSession:
         if float(sf_sum.item()) > 1e-9:
             s_field = s_field / sf_sum.clamp(min=1e-9)
 
-        mask = eng._mask_unk
         if cfg.scoring_method == "stats_only":
-            return mask(s_stats)
+            return s_stats
         if cfg.scoring_method == "concept_only":
             mix = s_direct + s_adopt + s_concept + cfg.alpha_field * s_field
-            return mask(_normalize(mix))
+            return _normalize(mix)
         if cfg.scoring_method == "permission_drive":
-            return mask(_combine_permission_drive(
+            return _combine_permission_drive(
                 s_direct, s_adopt, s_stats, s_concept,
                 s_field=s_field, cfg=cfg,
-            ))
+            )
         # Legacy linear mixture
         mix = (
             cfg.alpha_direct * s_direct
@@ -331,7 +330,7 @@ class InferenceSession:
             + cfg.alpha_field * s_field
             + cfg.alpha_stats * s_stats
         )
-        return mask(_normalize(mix))
+        return _normalize(mix)
 
     def generate(
         self,
@@ -346,7 +345,7 @@ class InferenceSession:
         for _ in range(length):
             if not out:
                 break
-            dist = self.score_next(int(out[-1]))
+            dist = self.engine._mask_unk(self.score_next(int(out[-1])))
             if temperature != 1.0:
                 dist = torch.pow(dist.clamp(min=1e-12), 1.0 / max(temperature, 1e-6))
                 dist = dist / dist.sum().clamp(min=1e-9)

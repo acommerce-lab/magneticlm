@@ -139,7 +139,7 @@ def evaluate_ood_cloze(
         session = engine.create_session()
         for t in toks:
             session.observe(t)
-        dist = session.score_next(toks[-1])
+        dist = engine._mask_unk(session.score_next(toks[-1]))
 
         _, idx = torch.topk(dist, 50)
         top = idx.tolist()
