@@ -125,6 +125,16 @@ def evaluate_ood_cloze(
         if not tgt_ids:
             continue
         tgt = tgt_ids[0]
+        is_unk = (tgt == vocab.unk_id)
+
+        # Skip UNK targets — hitting <unk> is meaningless
+        if is_unk:
+            details.append({
+                "context": context, "answer": answer,
+                "rank": None, "top5_words": [], "glow_centers": 0,
+                "answer_is_unk": True, "skipped": True,
+            })
+            continue
 
         session = engine.create_session()
         for t in toks:
@@ -143,12 +153,11 @@ def evaluate_ood_cloze(
                 hits[10] += 1
         total += 1
         glow = session.get_glow_centers().tolist()
-        top3_words = [vocab.itos[i] if i < len(vocab.itos) else "?" for i in top[:5]]
-        is_unk = (tgt == vocab.unk_id)
+        top5_words = [vocab.itos[i] if i < len(vocab.itos) else "?" for i in top[:5]]
         details.append({
             "context": context, "answer": answer,
-            "rank": rank, "top5_words": top3_words,
-            "glow_centers": len(glow), "answer_is_unk": is_unk,
+            "rank": rank, "top5_words": top5_words,
+            "glow_centers": len(glow), "answer_is_unk": False,
         })
     return {
         "ood_hit@1": hits[1] / max(total, 1),
@@ -207,14 +216,16 @@ def run_full_eval(
     if cfg.eval_ood_cloze:
         print("  [eval] OOD cloze (with session + glow)...")
         results["ood"] = evaluate_ood_cloze(engine, vocab)
-        print(f"    ood_hit@1 = {results['ood']['ood_hit@1']:.3f}")
-        print(f"    ood_hit@5 = {results['ood']['ood_hit@5']:.3f}")
-        print(f"    ood_hit@10 = {results['ood']['ood_hit@10']:.3f}")
-        for d in results["ood"].get("ood_details", []):
-            ans_info = f"unk={d.get('answer_is_unk')}" if d.get("answer_is_unk") else ""
+        ood = results["ood"]
+        n_skipped = sum(1 for d in ood.get("ood_details", []) if d.get("skipped"))
+        print(f"    ood_hit@1 = {ood['ood_hit@1']:.3f}  ood_hit@5 = {ood['ood_hit@5']:.3f}  ood_hit@10 = {ood['ood_hit@10']:.3f}  (tested={ood['ood_total']}, skipped_unk={n_skipped})")
+        for d in ood.get("ood_details", []):
+            if d.get("skipped"):
+                print(f"      [{d['context']!r}] -> SKIPPED ('{d['answer']}' is <unk>)")
+                continue
             rank_str = str(d["rank"]) if d["rank"] else ">50"
             top_str = " ".join(d.get("top5_words", []))
-            print(f"      [{d['context']!r}] -> rank={rank_str}  top5=[{top_str}]  glow={d['glow_centers']}  {ans_info}")
+            print(f"      [{d['context']!r}] -> rank={rank_str}  top5=[{top_str}]  glow={d['glow_centers']}")
 
     if cfg.eval_generation:
         print("  [eval] generation (with session + glow)...")

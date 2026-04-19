@@ -48,8 +48,11 @@ class InferenceEngine:
         V = self.stats.vocab_size
         freq = self.stats.unigram_counts.to(torch.float32).to(self.device)
         N = freq.sum().clamp(min=1.0)
-        self.idf = torch.log(N / (freq + 1.0) + 1.0)
-        self.idf = self.idf / self.idf.max().clamp(min=1e-9)
+        raw_idf = torch.log(N / (freq + 1.0) + 1.0)
+        raw_idf = raw_idf / raw_idf.max().clamp(min=1e-9)
+        # Blend: idf_strength=0 -> all ones (no effect), =1 -> full IDF
+        s = float(getattr(self.cfg, "idf_strength", 0.5))
+        self.idf = (1.0 - s) + s * raw_idf
 
     def create_session(self) -> "InferenceSession":
         return InferenceSession(self)
