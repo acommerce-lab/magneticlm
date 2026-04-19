@@ -144,7 +144,7 @@ def evaluate_ood_cloze(
         total += 1
         glow = session.get_glow_centers().tolist()
         top3_words = [vocab.itos[i] if i < len(vocab.itos) else "?" for i in top[:5]]
-        is_unk = (tgt == vocab.stoi.get(vocab.unk_token, -1))
+        is_unk = (tgt == vocab.unk_id)
         details.append({
             "context": context, "answer": answer,
             "rank": rank, "top5_words": top3_words,
