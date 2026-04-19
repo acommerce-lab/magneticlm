@@ -73,7 +73,19 @@ def _combine_permission_drive(
         drive = drive / drive_sum.clamp(min=1e-9)
 
     creative = float(getattr(cfg, "creative_strength", 0.0))
-    score = permission * (1.0 + cfg.drive_strength * drive) + creative * drive
+    if creative > 0.0:
+        # Creative channel fires only when Drive exceeds Permission — the
+        # "semantic leap" case. Function words have drive ≈ permission
+        # (saturated in both), so (D-P) ≈ 0 and the additive term stays silent.
+        # Content words with sparse direct context but strong semantic signal
+        # get (D-P) > 0, letting Drive express itself.
+        creative_signal = (drive - permission).clamp(min=0.0)
+        cs_sum = creative_signal.sum()
+        if float(cs_sum.item()) > 1e-9:
+            creative_signal = creative_signal / cs_sum.clamp(min=1e-9)
+        score = permission * (1.0 + cfg.drive_strength * drive) + creative * creative_signal
+    else:
+        score = permission * (1.0 + cfg.drive_strength * drive)
     return _normalize(score)
 
 
