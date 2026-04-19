@@ -14,18 +14,25 @@ Architecture: GPT-style decoder-only transformer.
 """
 
 import argparse
+import gc
 import json
 import math
 import os
 import sys
 import time
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+
+try:
+    import psutil
+    _HAS_PSUTIL = True
+except ImportError:
+    _HAS_PSUTIL = False
 
 # ---------------------------------------------------------------------------
 # Bootstrap: make magnetic_v3 importable regardless of folder name
@@ -45,6 +52,110 @@ if _pkg_name not in sys.modules:
 
 from magnetic_v3.data import load_dataset
 from magnetic_v3.tokenizer import build_vocab, encode_stream, tokenize
+
+
+# ---------------------------------------------------------------------------
+# Hardware setup: maximize GPU utilization
+# ---------------------------------------------------------------------------
+
+def setup_hardware():
+    """Enable cudnn benchmark, TF32, and report device capabilities."""
+    if not torch.cuda.is_available():
+        print("Hardware: CPU only")
+        return
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    n = torch.cuda.device_count()
+    names = [torch.cuda.get_device_name(i) for i in range(n)]
+    print(f"Hardware: {n} GPU(s): {names}")
+    print(f"  cudnn.benchmark=True  TF32=enabled")
+
+
+# ---------------------------------------------------------------------------
+# Memory monitoring (RAM + GPU)
+# ---------------------------------------------------------------------------
+
+def ram_status() -> Dict:
+    """Return dict with RAM usage info."""
+    if not _HAS_PSUTIL:
+        return {"available": False}
+    m = psutil.virtual_memory()
+    p = psutil.Process()
+    return {
+        "available": True,
+        "rss_gb": p.memory_info().rss / 1e9,
+        "sys_used_gb": (m.total - m.available) / 1e9,
+        "sys_available_gb": m.available / 1e9,
+        "sys_total_gb": m.total / 1e9,
+        "percent": m.percent,
+    }
+
+
+def gpu_status() -> List[Dict]:
+    """Return list of GPU memory usage dicts."""
+    if not torch.cuda.is_available():
+        return []
+    out = []
+    for i in range(torch.cuda.device_count()):
+        free, total = torch.cuda.mem_get_info(i)
+        out.append({
+            "gpu": i,
+            "used_gb": (total - free) / 1e9,
+            "total_gb": total / 1e9,
+            "percent": (1.0 - free / total) * 100.0,
+        })
+    return out
+
+
+def print_mem_snapshot(tag: str = ""):
+    """One-line memory snapshot for diagnostics."""
+    parts = []
+    r = ram_status()
+    if r.get("available"):
+        parts.append(
+            f"RAM={r['rss_gb']:.1f}GB "
+            f"sys={r['sys_used_gb']:.1f}/{r['sys_total_gb']:.1f}GB ({r['percent']:.0f}%)"
+        )
+    for g in gpu_status():
+        parts.append(
+            f"GPU{g['gpu']}={g['used_gb']:.1f}/{g['total_gb']:.1f}GB ({g['percent']:.0f}%)"
+        )
+    if parts:
+        print(f"  [mem{(' '+tag) if tag else ''}] " + "  ".join(parts))
+
+
+class MemoryGuard:
+    """Periodic memory check during training; triggers GC if near limit."""
+
+    def __init__(self, log_every: int = 100, warn_percent: float = 85.0):
+        self.log_every = max(1, log_every)
+        self.warn = warn_percent
+        self.step = 0
+        self.peak_rss = 0.0
+
+    def check(self, force: bool = False):
+        self.step += 1
+        if self.step % self.log_every != 0 and not force:
+            return
+        r = ram_status()
+        if not r.get("available"):
+            return
+        self.peak_rss = max(self.peak_rss, r["rss_gb"])
+        gs = gpu_status()
+        gpu_str = "  ".join(
+            f"GPU{g['gpu']}={g['percent']:.0f}%" for g in gs
+        )
+        print(
+            f"  [mem step={self.step}] "
+            f"rss={r['rss_gb']:.1f}GB  sys={r['percent']:.0f}%  "
+            f"{gpu_str}"
+        )
+        if r["percent"] > self.warn:
+            print(f"  [mem] WARNING sys mem {r['percent']:.0f}% — running gc/empty_cache")
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
 
 # ---------------------------------------------------------------------------
@@ -141,36 +252,92 @@ class DecoderBlock(nn.Module):
 
 
 # ======================================================================
-# Dataset
+# Dataset: disk-backed memmap option for large corpora
 # ======================================================================
 
+def encode_to_memmap(
+    encoded: List[np.ndarray],
+    out_path: str,
+    dtype=np.int32,
+) -> np.memmap:
+    """Flatten a list of encoded arrays into a disk-backed memmap.
+
+    Keeps RAM flat for 100K-1M+ line corpora. The OS pages chunks in/out
+    as the DataLoader reads from disk.
+    """
+    total = sum(int(a.size) for a in encoded if a.size > 0)
+    if total == 0:
+        raise ValueError("no tokens to encode")
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    arr = np.memmap(out_path, dtype=dtype, mode="w+", shape=(total,))
+    pos = 0
+    for a in encoded:
+        if a.size == 0:
+            continue
+        arr[pos:pos + a.size] = a.astype(dtype, copy=False)
+        pos += int(a.size)
+    arr.flush()
+    print(f"  [memmap] wrote {total:,} tokens to {out_path} "
+          f"({os.path.getsize(out_path) / 1e9:.2f} GB)")
+    return arr
+
+
+def estimate_ram_need_gb(n_lines: int, avg_tokens_per_line: float = 20.0) -> float:
+    """Rough estimate for encoded corpus RAM (int64 -> 8 bytes/token)."""
+    return n_lines * avg_tokens_per_line * 8 / 1e9
+
+
 class LMDataset(Dataset):
-    def __init__(self, encoded: List[np.ndarray], seq_len: int):
-        flat = np.concatenate([a for a in encoded if a.size > 1])
-        n = (len(flat) - 1) // seq_len * seq_len
-        self.data = torch.from_numpy(flat[:n + 1].astype(np.int64))
+    """Language model dataset over a flat token stream.
+
+    Accepts either in-memory numpy array or a memmap handle. Returns
+    (x, y) pairs where y is x shifted by one position.
+    """
+
+    def __init__(
+        self,
+        flat: np.ndarray,
+        seq_len: int,
+    ):
+        n_total = int(flat.shape[0])
+        n_aligned = ((n_total - 1) // seq_len) * seq_len
+        self.flat = flat  # keep as numpy / memmap; __getitem__ slices lazily
         self.seq_len = seq_len
-        self.n_examples = n // seq_len
+        self.n_examples = n_aligned // seq_len
+        self.limit = n_aligned + 1  # safe bound for [start+seq_len+1]
 
     def __len__(self):
         return self.n_examples
 
     def __getitem__(self, idx):
-        start = idx * self.seq_len
-        x = self.data[start : start + self.seq_len]
-        y = self.data[start + 1 : start + self.seq_len + 1]
-        return x, y
+        s = idx * self.seq_len
+        x = np.asarray(self.flat[s : s + self.seq_len], dtype=np.int64)
+        y = np.asarray(self.flat[s + 1 : s + self.seq_len + 1], dtype=np.int64)
+        return torch.from_numpy(x), torch.from_numpy(y)
 
 
 # ======================================================================
 # Training
 # ======================================================================
 
-def train_model(model, train_loader, epochs, lr, device, warmup_steps=200):
+def train_model(
+    model,
+    train_loader,
+    epochs: int,
+    lr: float,
+    device: torch.device,
+    warmup_steps: int = 200,
+    use_amp: bool = True,
+    grad_accum: int = 1,
+    mem_log_every: int = 100,
+    log_batches_every: int = 50,
+):
+    """Training loop with AMP, cosine LR, grad clipping, memory monitoring."""
     model.train()
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
 
-    total_steps = epochs * len(train_loader)
+    total_steps = max(1, epochs * len(train_loader) // max(grad_accum, 1))
+
     def lr_schedule(step):
         if step < warmup_steps:
             return step / max(warmup_steps, 1)
@@ -178,95 +345,161 @@ def train_model(model, train_loader, epochs, lr, device, warmup_steps=200):
         return 0.5 * (1.0 + math.cos(math.pi * progress))
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_schedule)
+
+    amp_enabled = use_amp and device.type == "cuda"
+    scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
+    autocast_dtype = torch.float16  # T4 supports fp16, not bf16
+
+    guard = MemoryGuard(log_every=mem_log_every, warn_percent=88.0)
     step = 0
+    micro_step = 0
     t0 = time.time()
 
     for epoch in range(1, epochs + 1):
         total_loss = 0.0
         n_batches = 0
-        for x, y in train_loader:
-            x, y = x.to(device), y.to(device)
-            logits = model(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
-            optimizer.zero_grad()
-            loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            scheduler.step()
-            total_loss += loss.item()
+        t_epoch = time.time()
+        optimizer.zero_grad(set_to_none=True)
+
+        for batch_idx, (x, y) in enumerate(train_loader):
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+
+            with torch.cuda.amp.autocast(enabled=amp_enabled, dtype=autocast_dtype):
+                logits = model(x)
+                loss = F.cross_entropy(
+                    logits.view(-1, logits.size(-1)), y.view(-1)
+                )
+                loss_for_backward = loss / max(grad_accum, 1)
+
+            scaler.scale(loss_for_backward).backward()
+            micro_step += 1
+
+            if micro_step % grad_accum == 0:
+                scaler.unscale_(optimizer)
+                nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+                scheduler.step()
+                step += 1
+
+            total_loss += float(loss.item())
             n_batches += 1
-            step += 1
+            guard.check()
+
+            if (batch_idx + 1) % log_batches_every == 0:
+                rate = (batch_idx + 1) / max(time.time() - t_epoch, 1e-6)
+                print(f"    batch {batch_idx+1}/{len(train_loader)}  "
+                      f"loss={loss.item():.4f}  rate={rate:.1f} batch/s")
 
         avg = total_loss / max(n_batches, 1)
         elapsed = time.time() - t0
-        print(f"  epoch {epoch}/{epochs}  loss={avg:.4f}  "
-              f"ppl={math.exp(min(avg, 20)):.1f}  time={elapsed:.1f}s")
+        print(
+            f"  epoch {epoch}/{epochs}  loss={avg:.4f}  "
+            f"ppl={math.exp(min(avg, 20)):.1f}  "
+            f"time_epoch={time.time()-t_epoch:.1f}s  total={elapsed:.1f}s"
+        )
+        print_mem_snapshot(f"end-epoch-{epoch}")
+
+    print(f"  peak RSS during training: {guard.peak_rss:.2f} GB")
 
 
 # ======================================================================
 # Evaluation
 # ======================================================================
 
+def _flatten_valid(encoded: List[np.ndarray]) -> np.ndarray:
+    arrs = [a for a in encoded if a.size > 1]
+    if not arrs:
+        return np.empty(0, dtype=np.int64)
+    return np.concatenate(arrs).astype(np.int64)
+
+
 @torch.no_grad()
-def evaluate_ppl(model, encoded, vocab, device, max_tokens=200000, seq_len=128):
+def evaluate_ppl(model, encoded, vocab, device, max_tokens=200000,
+                 seq_len=128, batch_size=32, use_amp=True):
+    """Batched PPL: flattens stream, chunks into seq_len windows, processes B at once."""
     model.eval()
-    nll = 0.0
+    flat = _flatten_valid(encoded)
+    n_tokens_available = max(0, len(flat) - 1)
+    if n_tokens_available == 0:
+        return {"ppl": float("inf"), "n_tokens": 0}
+
+    t = torch.from_numpy(flat).to(device)
+    n_windows = (len(flat) - 1) // seq_len
+    if n_windows == 0:
+        return {"ppl": float("inf"), "n_tokens": 0}
+
+    amp_enabled = use_amp and device.type == "cuda"
+    nll_sum = 0.0
     n = 0
-    for arr in encoded:
-        if arr.size < 2:
-            continue
-        t = torch.from_numpy(arr.astype(np.int64)).to(device)
-        for start in range(0, len(t) - 1, seq_len):
-            end = min(start + seq_len, len(t) - 1)
-            x = t[start:end].unsqueeze(0)
-            y = t[start + 1:end + 1]
-            logits = model(x).squeeze(0)
-            log_probs = F.log_softmax(logits, dim=-1)
-            for i in range(len(y)):
-                nll += -log_probs[i, y[i]].item()
-                n += 1
-                if n >= max_tokens:
-                    break
-            if n >= max_tokens:
-                break
+    t_start = time.time()
+
+    for b_start in range(0, n_windows, batch_size):
+        b_end = min(b_start + batch_size, n_windows)
+        B = b_end - b_start
+        idx = torch.arange(b_start, b_end, device=device) * seq_len
+        offsets = torch.arange(seq_len, device=device).unsqueeze(0)
+        x = t[idx.unsqueeze(1) + offsets]
+        y = t[idx.unsqueeze(1) + offsets + 1]
+
+        with torch.cuda.amp.autocast(enabled=amp_enabled, dtype=torch.float16):
+            logits = model(x)
+        log_probs = F.log_softmax(logits.float(), dim=-1)
+        gathered = log_probs.gather(2, y.unsqueeze(-1)).squeeze(-1)  # [B, T]
+        nll_sum += float((-gathered).sum().item())
+        n += int(gathered.numel())
         if n >= max_tokens:
             break
-    if n == 0:
-        return {"ppl": float("inf"), "n_tokens": 0}
-    return {"ppl": math.exp(nll / n), "n_tokens": n}
+
+    return {
+        "ppl": math.exp(nll_sum / max(n, 1)),
+        "n_tokens": n,
+        "time_s": time.time() - t_start,
+    }
 
 
 @torch.no_grad()
 def evaluate_hit_rate(model, encoded, device, top_k_list=(1, 5, 10, 50),
-                      max_tokens=100000, seq_len=128):
+                      max_tokens=100000, seq_len=128, batch_size=32, use_amp=True):
+    """Batched hit-rate: fully vectorized over all (B, T) positions per batch."""
     model.eval()
+    flat = _flatten_valid(encoded)
+    if len(flat) < 2:
+        return {f"hit@{k}": 0.0 for k in top_k_list}
+
+    t = torch.from_numpy(flat).to(device)
+    n_windows = (len(flat) - 1) // seq_len
+    if n_windows == 0:
+        return {f"hit@{k}": 0.0 for k in top_k_list}
+
+    amp_enabled = use_amp and device.type == "cuda"
+    max_k = max(top_k_list)
     hits = {k: 0 for k in top_k_list}
     n = 0
-    for arr in encoded:
-        if arr.size < 2:
-            continue
-        t = torch.from_numpy(arr.astype(np.int64)).to(device)
-        for start in range(0, len(t) - 1, seq_len):
-            end = min(start + seq_len, len(t) - 1)
-            x = t[start:end].unsqueeze(0)
-            y = t[start + 1:end + 1]
-            logits = model(x).squeeze(0)
-            _, top_idx = torch.topk(logits, max(top_k_list), dim=-1)
-            for i in range(len(y)):
-                top_i = top_idx[i].tolist()
-                for k in top_k_list:
-                    if int(y[i].item()) in top_i[:k]:
-                        hits[k] += 1
-                n += 1
-                if n >= max_tokens:
-                    break
-            if n >= max_tokens:
-                break
+
+    for b_start in range(0, n_windows, batch_size):
+        b_end = min(b_start + batch_size, n_windows)
+        idx = torch.arange(b_start, b_end, device=device) * seq_len
+        offsets = torch.arange(seq_len, device=device).unsqueeze(0)
+        x = t[idx.unsqueeze(1) + offsets]
+        y = t[idx.unsqueeze(1) + offsets + 1]
+
+        with torch.cuda.amp.autocast(enabled=amp_enabled, dtype=torch.float16):
+            logits = model(x)
+        _, top_idx = torch.topk(logits, max_k, dim=-1)  # [B, T, max_k]
+
+        # Vectorized hit computation for each k
+        y_expanded = y.unsqueeze(-1)  # [B, T, 1]
+        for k in top_k_list:
+            hit_mask = (top_idx[..., :k] == y_expanded).any(dim=-1)  # [B, T]
+            hits[k] += int(hit_mask.sum().item())
+        n += int(y.numel())
         if n >= max_tokens:
             break
-    if n == 0:
-        return {f"hit@{k}": 0.0 for k in top_k_list}
-    return {f"hit@{k}": hits[k] / n for k in top_k_list}
+
+    return {f"hit@{k}": hits[k] / max(n, 1) for k in top_k_list}
 
 
 @torch.no_grad()
@@ -369,8 +602,28 @@ def main():
     parser.add_argument("--dropout", type=float, default=0.1)
 
     parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--eval_batch_size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--grad_accum", type=int, default=1)
+
+    # Hardware knobs
+    parser.add_argument("--amp", default="auto",
+                        help="auto|on|off — mixed precision (fp16 on T4)")
+    parser.add_argument("--multi_gpu", default="auto",
+                        help="auto|on|off — DataParallel across all GPUs")
+    parser.add_argument("--num_workers", type=int, default=-1,
+                        help="DataLoader workers; -1=auto based on cpu_count()")
+    parser.add_argument("--compile", action="store_true",
+                        help="torch.compile the model (PyTorch 2.x)")
+
+    # Memory management
+    parser.add_argument("--memmap", default="auto",
+                        help="auto|on|off — disk-backed token stream")
+    parser.add_argument("--memmap_threshold_gb", type=float, default=2.0,
+                        help="encoded corpus size above which memmap auto-enables")
+    parser.add_argument("--mem_log_every", type=int, default=100,
+                        help="log memory status every N training batches")
 
     parser.add_argument("--eval_generation", action="store_true")
     parser.add_argument("--gen_length", type=int, default=30)
@@ -393,7 +646,9 @@ def main():
     print("=" * 70)
     print("Baseline Transformer LM")
     print("=" * 70)
-    print(f"Device: {device}")
+    setup_hardware()
+    print(f"Primary device: {device}")
+    print_mem_snapshot("startup")
 
     # --- Config shim so data.py works ---
     class CfgShim:
@@ -414,11 +669,52 @@ def main():
     print("Encoding...")
     encoded_train = encode_stream(train_lines, vocab)
     encoded_valid = encode_stream(valid_lines, vocab)
+    # Free the Python line lists — they can be large for 1M corpora
+    del train_lines
+    del valid_lines
+    gc.collect()
 
-    train_ds = LMDataset(encoded_train, args.seq_len)
+    # ---- Decide memmap vs in-memory for training stream ----
+    est_gb = estimate_ram_need_gb(args.max_train_lines if args.max_train_lines > 0 else len(encoded_train))
+    use_memmap = {"on": True, "off": False}.get(
+        args.memmap, est_gb > args.memmap_threshold_gb
+    )
+    os.makedirs(args.save_dir, exist_ok=True)
+    if use_memmap:
+        memmap_path = os.path.join(args.save_dir, "train_tokens.bin")
+        train_flat = encode_to_memmap(encoded_train, memmap_path, dtype=np.int32)
+        del encoded_train
+        gc.collect()
+        print(f"  [memmap] training stream on disk (estimated in-RAM: {est_gb:.2f} GB)")
+    else:
+        arrs = [a for a in encoded_train if a.size > 1]
+        train_flat = np.concatenate(arrs).astype(np.int32) if arrs else np.empty(0, dtype=np.int32)
+        del encoded_train
+        gc.collect()
+        print(f"  [memory] training stream in RAM (est {est_gb:.2f} GB)")
+    print_mem_snapshot("after-encode")
+
+    train_ds = LMDataset(train_flat, args.seq_len)
+    if len(train_ds) == 0:
+        print("ERROR: no training examples after chunking. Increase --max_train_lines "
+              "or decrease --seq_len.")
+        return
+
+    # DataLoader worker selection
+    if args.num_workers < 0:
+        cpu_count = os.cpu_count() or 1
+        n_workers = max(0, min(4, cpu_count - 1))
+    else:
+        n_workers = args.num_workers
+
     train_loader = DataLoader(
-        train_ds, batch_size=args.batch_size, shuffle=True,
-        num_workers=0, pin_memory=(device.type == "cuda"),
+        train_ds,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=n_workers,
+        pin_memory=(device.type == "cuda"),
+        persistent_workers=(n_workers > 0),
+        prefetch_factor=(4 if n_workers > 0 else None),
     )
 
     model = TransformerLM(
@@ -431,37 +727,90 @@ def main():
         dropout=args.dropout,
     ).to(device)
 
-    n_params = model.count_params()
+    # Multi-GPU wrap
+    n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    mg_flag = args.multi_gpu
+    do_multi = (
+        (mg_flag == "on") or (mg_flag == "auto" and n_gpus >= 2)
+    ) and mg_flag != "off" and n_gpus >= 2
+    if do_multi:
+        model = nn.DataParallel(model)
+        print(f"Multi-GPU: DataParallel across {n_gpus} GPUs")
+    else:
+        print(f"Multi-GPU: disabled (n_gpus={n_gpus})")
+
+    if args.compile and hasattr(torch, "compile"):
+        print("torch.compile: enabled")
+        model = torch.compile(model)
+
+    # AMP decision
+    amp_flag = args.amp
+    use_amp = (amp_flag == "on") or (amp_flag == "auto" and device.type == "cuda")
+    if amp_flag == "off":
+        use_amp = False
+    print(f"AMP (fp16): {'on' if use_amp else 'off'}")
+    print(f"DataLoader: num_workers={n_workers}  pin_memory={device.type=='cuda'}")
+
+    base_model = model.module if isinstance(model, nn.DataParallel) else model
+    n_params = base_model.count_params() if hasattr(base_model, "count_params") \
+        else sum(p.numel() for p in model.parameters())
     print(f"Model: {args.n_layers}L/{args.n_heads}H/d={args.d_model}  "
           f"params={n_params:,}  seq_len={args.seq_len}")
-    print(f"Training: {args.epochs} epochs, batch={args.batch_size}, "
+    print(f"Training: {args.epochs} epochs, batch={args.batch_size} "
+          f"(grad_accum={args.grad_accum}, effective={args.batch_size*args.grad_accum}), "
           f"lr={args.lr}, dataset={len(train_ds)} examples")
     print("-" * 70)
 
     t0 = time.time()
-    train_model(model, train_loader, args.epochs, args.lr, device)
+    train_model(
+        model, train_loader, args.epochs, args.lr, device,
+        use_amp=use_amp,
+        grad_accum=args.grad_accum,
+        mem_log_every=args.mem_log_every,
+    )
     train_time = time.time() - t0
     print(f"Training done in {train_time:.1f}s")
+    print_mem_snapshot("post-train")
 
     print("-" * 70)
     print("Evaluation...")
+    # Unwrap DataParallel for single-sample eval (avoids unnecessary scatter/gather)
+    eval_model = model.module if isinstance(model, nn.DataParallel) else model
 
-    results: Dict = {"model": "transformer_baseline", "params": n_params,
-                     "train_lines": args.max_train_lines, "train_time_s": train_time}
+    results: Dict = {
+        "model": "transformer_baseline",
+        "params": n_params,
+        "train_lines": args.max_train_lines,
+        "train_time_s": train_time,
+        "hardware": {
+            "n_gpus": n_gpus,
+            "multi_gpu": do_multi,
+            "amp": use_amp,
+            "memmap": use_memmap,
+            "num_workers": n_workers,
+        },
+    }
 
     print("  [eval] PPL...")
-    ppl_res = evaluate_ppl(model, encoded_valid, vocab, device)
+    ppl_res = evaluate_ppl(
+        eval_model, encoded_valid, vocab, device,
+        seq_len=args.seq_len, batch_size=args.eval_batch_size, use_amp=use_amp,
+    )
     results["ppl"] = ppl_res
-    print(f"    PPL = {ppl_res['ppl']:.2f} on {ppl_res['n_tokens']} tokens")
+    print(f"    PPL = {ppl_res['ppl']:.2f} on {ppl_res['n_tokens']} tokens "
+          f"(in {ppl_res.get('time_s', 0):.1f}s)")
 
     print("  [eval] hit rate...")
-    hr_res = evaluate_hit_rate(model, encoded_valid, device)
+    hr_res = evaluate_hit_rate(
+        eval_model, encoded_valid, device,
+        seq_len=args.seq_len, batch_size=args.eval_batch_size, use_amp=use_amp,
+    )
     results["hit_rate"] = hr_res
     for k, v in hr_res.items():
         print(f"    {k} = {v:.4f}")
 
     print("  [eval] OOD cloze...")
-    ood_res = evaluate_ood_cloze(model, vocab, device, args.seq_len)
+    ood_res = evaluate_ood_cloze(eval_model, vocab, device, args.seq_len)
     results["ood"] = ood_res
     n_skipped = sum(1 for d in ood_res.get("ood_details", []) if d.get("skipped"))
     print(f"    ood_hit@1 = {ood_res['ood_hit@1']:.3f}  "
@@ -482,7 +831,7 @@ def main():
         gen_results = []
         for prompt in prompts:
             gen_ids = generate(
-                model, vocab, prompt,
+                eval_model, vocab, prompt,
                 length=args.gen_length,
                 top_k=args.gen_top_k,
                 device=device,
@@ -494,11 +843,22 @@ def main():
             print(f"      {gen_text[:200]}")
         results["generation"] = gen_results
 
+    print_mem_snapshot("post-eval")
+    peak_gpu = 0.0
+    if torch.cuda.is_available():
+        peak_gpu = max(
+            (torch.cuda.max_memory_allocated(i) / 1e9
+             for i in range(torch.cuda.device_count())),
+            default=0.0,
+        )
+    results["peak_gpu_alloc_gb"] = peak_gpu
+
     os.makedirs(args.save_dir, exist_ok=True)
     out_path = os.path.join(args.save_dir, "baseline_transformer_results.json")
     with open(out_path, "w") as f:
         json.dump(results, f, indent=2, default=str)
     print(f"\nSaved -> {out_path}")
+    print(f"Peak GPU alloc: {peak_gpu:.2f} GB")
     print("Done.")
 
 
