@@ -59,32 +59,38 @@ def _list_available_dirs() -> str:
 
 
 def _hf_download_wikitext(data_dir: str) -> Optional[Tuple[str, str]]:
-    """Fallback: fetch wikitext-103 via HuggingFace datasets, write .tokens files."""
-    try:
-        from datasets import load_dataset as _hf_load
-    except ImportError:
-        return None
+    """Fallback: fetch wikitext-103 via HuggingFace datasets.
 
+    Uses the same proven pattern as MagneticLMFastRunner.ensure_wt103:
+      - Salesforce/wikitext (the current canonical repo)
+      - strip whitespace, skip header lines starting with "="
+    """
     target_dir = os.path.join(data_dir, "wikitext-103")
+    os.makedirs(target_dir, exist_ok=True)
     train_path = os.path.join(target_dir, "wiki.train.tokens")
     valid_path = os.path.join(target_dir, "wiki.valid.tokens")
     if os.path.exists(train_path) and os.path.exists(valid_path):
         return train_path, valid_path
 
-    print("  [hf] downloading wikitext-103 via HuggingFace datasets...")
+    print("  [hf] downloading WikiText-103 (via HF datasets)...")
     try:
-        ds = _hf_load("wikitext", "wikitext-103-v1")
+        from datasets import load_dataset as _hf_load
+    except ImportError:
+        print("  [hf] ERROR: first-time download needs `pip install datasets`.")
+        return None
+
+    try:
+        ds = _hf_load("Salesforce/wikitext", "wikitext-103-v1")
     except Exception as e:
         print(f"  [hf] download failed: {e}")
         return None
 
-    os.makedirs(target_dir, exist_ok=True)
     for split, path in (("train", train_path), ("validation", valid_path)):
         with open(path, "w", encoding="utf-8") as f:
-            for row in ds[split]:
-                text = row["text"]
-                if text:
-                    f.write(text if text.endswith("\n") else text + "\n")
+            for item in ds[split]:
+                t = item["text"].strip()
+                if t and not t.startswith("="):
+                    f.write(t + "\n")
     print(f"  [hf] wrote {train_path} and {valid_path}")
     return train_path, valid_path
 
