@@ -27,18 +27,20 @@ class Config:
     # =====================================================================
     # Statistical layer
     #   capacity_method: how to turn node-level stats into capacity C(n)
-    #     - "entropy"         : C(n) = k_base * (1 - H(n)/H_max)
+    #     - "entropy"         : C(n) = floor + (k_base - floor) * (1 - H(n)/H_max)
     #     - "log_inv_freq"    : C(n) = k_base * log(N / freq(n) + 1)
     #     - "uniform"         : C(n) = k_base
     #   k_base_method:
-    #     - "median_neighbors": median |distinct_neighbors|
+    #     - "percentile"      : k_base = quantile(distinct_neighbors, k_base_percentile)
+    #     - "median_neighbors": median |distinct_neighbors|  (legacy, collapses)
     #     - "fixed"           : k_base_fixed
     # =====================================================================
     stat_window: int = 5
     ppmi_min_count: int = 5
     ppmi_threshold: float = 1.0
     capacity_method: str = "entropy"
-    k_base_method: str = "median_neighbors"
+    k_base_method: str = "percentile"
+    k_base_percentile: float = 0.9
     k_base_fixed: int = 50
     capacity_multiplier: float = 1.0
     capacity_min: int = 4
@@ -77,9 +79,20 @@ class Config:
 
     # =====================================================================
     # Concept layer (many-to-many word <-> concept)
+    #   concept_ppmi_mode:
+    #     - "percentile" : keep top-(1-p) edges by PPMI  (adapts to scale)
+    #     - "fixed"      : keep edges with PPMI >= concept_ppmi_threshold
+    #   concept_method:
+    #     - "split"   : components + iterative pruning of oversized clusters
+    #     - "labelprop": weighted label propagation (finer granularity)
+    #     - "components": raw connected components (legacy, collapses)
     # =====================================================================
     use_concepts: bool = True
+    concept_ppmi_mode: str = "percentile"
+    concept_ppmi_percentile: float = 0.8
     concept_ppmi_threshold: float = 2.0
+    concept_method: str = "split"
+    concept_split_max_iter: int = 12
     concept_min_size: int = 3
     concept_max_size: int = 500
 

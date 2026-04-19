@@ -64,11 +64,21 @@ def register_capacity(name: str):
 
 @register_capacity("entropy")
 def _cap_entropy(stats, cfg, k_base: float) -> torch.Tensor:
+    """C(n) = floor + (k_base - floor) * (1 - H(n)/H_max).
+
+    Floor is capacity_min: every node gets at least this many slots.
+    Ceiling is k_base: high-entropy (diffuse) words stay near floor;
+    low-entropy (focused) words grow up to k_base. This gives a real
+    dynamic range even when k_base is small, unlike the old formula
+    which collapsed to floor for everyone when k_base <= floor.
+    """
     H = stats["entropy"]
     H_max = stats["entropy_max"]
-    scale = 1.0 - (H / (H_max + 1e-9))
-    cap = k_base * cfg.capacity_multiplier * scale
-    return cap
+    floor = float(cfg.capacity_min)
+    ceiling = max(float(k_base), floor + 1.0)
+    scale = (1.0 - (H / (H_max + 1e-9))).clamp(min=0.0, max=1.0)
+    cap = floor + (ceiling - floor) * scale
+    return cap * cfg.capacity_multiplier
 
 
 @register_capacity("log_inv_freq")
@@ -166,9 +176,21 @@ def build_statistics(
     entropy = _row_entropy(c_rows, c_cols, c_counts, V, device)
     H_max = float(np.log2(max(V, 2)))
 
-    # k_base
-    if cfg.k_base_method == "median_neighbors":
-        # unique neighbors per row count
+    # k_base — derived from the degree distribution of the PPMI graph.
+    # The old "median" default collapses to 2-4 and kills capacity dynamic
+    # range. "percentile" (default 0.9) tracks the long tail so a meaningful
+    # fraction of nodes can grow edges far above the floor.
+    method = cfg.k_base_method
+    if method in ("percentile", "percentile_neighbors") or method.startswith("percentile"):
+        uniq_rows, neighbor_counts = torch.unique(c_rows, return_counts=True)
+        if neighbor_counts.numel() == 0:
+            k_base = float(cfg.k_base_fixed)
+        else:
+            pct = float(getattr(cfg, "k_base_percentile", 0.9))
+            k_base = float(
+                torch.quantile(neighbor_counts.to(torch.float32), pct).item()
+            )
+    elif method == "median_neighbors":
         uniq_rows, neighbor_counts = torch.unique(c_rows, return_counts=True)
         if neighbor_counts.numel() == 0:
             k_base = float(cfg.k_base_fixed)
