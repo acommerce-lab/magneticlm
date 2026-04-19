@@ -131,7 +131,7 @@ def evaluate_ood_cloze(
             session.observe(t)
         dist = session.score_next(toks[-1])
 
-        _, idx = torch.topk(dist, 10)
+        _, idx = torch.topk(dist, 50)
         top = idx.tolist()
         rank = top.index(tgt) + 1 if tgt in top else None
         if rank is not None:
@@ -143,9 +143,12 @@ def evaluate_ood_cloze(
                 hits[10] += 1
         total += 1
         glow = session.get_glow_centers().tolist()
+        top3_words = [vocab.itos[i] if i < len(vocab.itos) else "?" for i in top[:5]]
+        is_unk = (tgt == vocab.stoi.get(vocab.unk_token, -1))
         details.append({
             "context": context, "answer": answer,
-            "rank": rank, "top3": top[:3], "glow_centers": len(glow),
+            "rank": rank, "top5_words": top3_words,
+            "glow_centers": len(glow), "answer_is_unk": is_unk,
         })
     return {
         "ood_hit@1": hits[1] / max(total, 1),
@@ -208,8 +211,10 @@ def run_full_eval(
         print(f"    ood_hit@5 = {results['ood']['ood_hit@5']:.3f}")
         print(f"    ood_hit@10 = {results['ood']['ood_hit@10']:.3f}")
         for d in results["ood"].get("ood_details", []):
-            if d.get("rank"):
-                print(f"      [{d['context']!r}] -> rank={d['rank']}  glow={d['glow_centers']}")
+            ans_info = f"unk={d.get('answer_is_unk')}" if d.get("answer_is_unk") else ""
+            rank_str = str(d["rank"]) if d["rank"] else ">50"
+            top_str = " ".join(d.get("top5_words", []))
+            print(f"      [{d['context']!r}] -> rank={rank_str}  top5=[{top_str}]  glow={d['glow_centers']}  {ans_info}")
 
     if cfg.eval_generation:
         print("  [eval] generation (with session + glow)...")

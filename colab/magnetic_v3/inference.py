@@ -39,11 +39,17 @@ class InferenceEngine:
     device: torch.device
     sem_sparse: Optional[torch.Tensor] = None
     node_stats: Optional[Dict[str, torch.Tensor]] = None
+    idf: Optional[torch.Tensor] = None
 
     def prepare(self):
         self.sem_sparse = to_sparse_tensor(self.sem, self.device)
         if self.cfg.transfer_method == "threshold_auto":
             self.node_stats = compute_node_thresholds(self.sem_sparse)
+        V = self.stats.vocab_size
+        freq = self.stats.unigram_counts.to(torch.float32).to(self.device)
+        N = freq.sum().clamp(min=1.0)
+        self.idf = torch.log(N / (freq + 1.0) + 1.0)
+        self.idf = self.idf / self.idf.max().clamp(min=1e-9)
 
     def create_session(self) -> "InferenceSession":
         return InferenceSession(self)
@@ -95,7 +101,11 @@ class InferenceEngine:
         if e > s:
             cols = self.ctx.col_idx[s:e].to(torch.int64)
             cnts = self.ctx.counts[s:e].to(torch.float32)
-            scores.scatter_add_(0, cols, cnts)
+            # Sublinear + IDF: sqrt dampens raw count; IDF lifts rare words
+            dampened = torch.sqrt(cnts)
+            if self.idf is not None:
+                dampened = dampened * self.idf[cols]
+            scores.scatter_add_(0, cols, dampened)
             scores /= scores.sum().clamp(min=1e-9)
         return scores
 
@@ -113,7 +123,10 @@ class InferenceEngine:
             if e > s:
                 cols = self.ctx.col_idx[s:e].to(torch.int64)
                 cnts = self.ctx.counts[s:e].to(torch.float32)
-                scores.scatter_add_(0, cols, cnts * n_weight)
+                dampened = torch.sqrt(cnts) * n_weight
+                if self.idf is not None:
+                    dampened = dampened * self.idf[cols]
+                scores.scatter_add_(0, cols, dampened)
         total = scores.sum().clamp(min=1e-9)
         return scores / total
 
@@ -147,7 +160,11 @@ class InferenceEngine:
         p_kn = bigram_prob(self.stats, a, all_b)
         s2 = p_kn.sum().clamp(min=1e-9)
         p_kn = p_kn / s2
-        combined = 0.5 * p_ppmi + 0.5 * p_kn
+        # PPMI already corrects for frequency; KN is frequency-dominated.
+        # Lean heavily on PPMI, use KN only as backoff for unseen pairs.
+        combined = 0.7 * p_ppmi + 0.3 * p_kn
+        if self.idf is not None:
+            combined = combined * self.idf
         return combined / combined.sum().clamp(min=1e-9)
 
 
