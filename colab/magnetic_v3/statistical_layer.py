@@ -139,9 +139,10 @@ def build_statistics(
     total = uni.sum().clamp(min=1).float()
     uni_prob = uni.float() / total
 
-    # Bigram (direct A->B, window=1)
-    bigram_pairs = _collect_pairs(encoded, V, window=1, symmetric=False, device=device)
-    bg_rows, bg_cols, bg_counts = _reduce_pairs(bigram_pairs, V)
+    # Bigram (direct A->B, window=1) — now returns (rows, cols, counts) directly
+    bg_rows, bg_cols, bg_counts = _collect_pairs(
+        encoded, V, window=1, symmetric=False, device=device
+    )
 
     # Kneser-Ney smoothed bigram probabilities per row
     bg_row_ptr, bg_search_key, bg_prob, bg_backoff = _kn_smoothed(
@@ -149,10 +150,9 @@ def build_statistics(
     )
 
     # Context pairs for PPMI/entropy (symmetric window)
-    ctx_pairs = _collect_pairs(
+    c_rows, c_cols, c_counts = _collect_pairs(
         encoded, V, window=cfg.stat_window, symmetric=True, device=device
     )
-    c_rows, c_cols, c_counts = _reduce_pairs(ctx_pairs, V)
 
     # Filter by min count
     keep = c_counts >= cfg.ppmi_min_count
@@ -235,46 +235,91 @@ def _collect_pairs(
     window: int,
     symmetric: bool,
     device: torch.device,
-    chunk_limit: int = 50_000_000,
-) -> torch.Tensor:
-    """Vectorized pair collection: one GPU transfer, all distances at once.
+    chunk_tokens: int = 4_000_000,
+):
+    """Chunked GPU pair collection with on-the-fly reduction.
 
-    Old code did 100K individual GPU transfers (one per sentence).
-    New code concatenates all tokens into one tensor, assigns sentence IDs,
-    and masks cross-sentence pairs using a single comparison per distance.
-    At 100K lines this is ~100-1000x faster.
+    Returns (rows, cols, counts) as GPU tensors — already deduplicated.
+    Each chunk's pairs are reduced (sort+unique_consecutive) before the
+    next chunk processes, keeping peak GPU memory bounded regardless of
+    corpus size. Chunk-level reduced results are merged via scatter_add.
     """
     valid = [a for a in encoded if a.size >= 2]
     if not valid:
-        return torch.empty(0, dtype=torch.int64, device=device)
+        empty = torch.empty(0, dtype=torch.int64, device=device)
+        return empty, empty, torch.empty(0, dtype=torch.float32, device=device)
 
-    flat = np.concatenate(valid).astype(np.int64)
-    sent_ids = np.concatenate([
-        np.full(a.size, i, dtype=np.int32) for i, a in enumerate(valid)
-    ])
+    # Group sentences into chunks by cumulative token count
+    chunks: List[List[np.ndarray]] = []
+    cur: List[np.ndarray] = []
+    cur_sz = 0
+    for a in valid:
+        cur.append(a)
+        cur_sz += a.size
+        if cur_sz >= chunk_tokens:
+            chunks.append(cur)
+            cur = []
+            cur_sz = 0
+    if cur:
+        chunks.append(cur)
 
-    t = torch.from_numpy(flat).to(device)
-    sid = torch.from_numpy(sent_ids).to(device)
-    n = t.numel()
+    all_keys_cpu: List[torch.Tensor] = []
+    all_counts_cpu: List[torch.Tensor] = []
 
-    buf: List[torch.Tensor] = []
-    for d in range(1, window + 1):
-        if d >= n:
-            break
-        a = t[:-d]
-        b = t[d:]
-        same = sid[:-d] == sid[d:]
-        a_s = a[same]
-        b_s = b[same]
-        if a_s.numel() == 0:
+    for chunk in chunks:
+        flat = np.concatenate(chunk).astype(np.int64)
+        sent_ids = np.concatenate([
+            np.full(a.size, i, dtype=np.int32) for i, a in enumerate(chunk)
+        ])
+        t = torch.from_numpy(flat).to(device)
+        sid = torch.from_numpy(sent_ids).to(device)
+        n = t.numel()
+
+        chunk_buf: List[torch.Tensor] = []
+        for d in range(1, window + 1):
+            if d >= n:
+                break
+            same = sid[:-d] == sid[d:]
+            a = t[:-d][same]
+            b = t[d:][same]
+            if a.numel() == 0:
+                continue
+            chunk_buf.append(_pair_ids(a, b, V))
+            if symmetric:
+                chunk_buf.append(_pair_ids(b, a, V))
+        del t, sid
+
+        if not chunk_buf:
             continue
-        buf.append(_pair_ids(a_s, b_s, V))
-        if symmetric:
-            buf.append(_pair_ids(b_s, a_s, V))
 
-    if not buf:
-        return torch.empty(0, dtype=torch.int64, device=device)
-    return torch.cat(buf)
+        chunk_ids = torch.cat(chunk_buf)
+        del chunk_buf
+        sorted_ids, _ = torch.sort(chunk_ids)
+        del chunk_ids
+        uniq, counts = torch.unique_consecutive(sorted_ids, return_counts=True)
+        del sorted_ids
+        all_keys_cpu.append(uniq.cpu())
+        all_counts_cpu.append(counts.to(torch.int64).cpu())
+        torch.cuda.empty_cache()
+
+    if not all_keys_cpu:
+        empty = torch.empty(0, dtype=torch.int64, device=device)
+        return empty, empty, torch.empty(0, dtype=torch.float32, device=device)
+
+    all_keys = torch.cat(all_keys_cpu).to(device)
+    all_counts = torch.cat(all_counts_cpu).to(device).to(torch.int64)
+
+    sort_idx = torch.argsort(all_keys)
+    all_keys = all_keys[sort_idx]
+    all_counts = all_counts[sort_idx]
+
+    uniq, inverse = torch.unique_consecutive(all_keys, return_inverse=True)
+    final_counts = torch.zeros(uniq.numel(), dtype=torch.int64, device=device)
+    final_counts.scatter_add_(0, inverse, all_counts)
+
+    rows = (uniq // V).to(torch.int64)
+    cols = (uniq % V).to(torch.int64)
+    return rows, cols, final_counts.to(torch.float32)
 
 
 def _dedup_sort(x: torch.Tensor) -> torch.Tensor:
