@@ -33,8 +33,12 @@ class WaveResult:
 
 
 def _sparse_mv(adj: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-    """Sparse matrix-vector multiply, CSR-friendly."""
-    return torch.sparse.mm(adj, x.unsqueeze(1)).squeeze(1)
+    """Sparse matrix-vector: result[b] = Σ_a adj[a,b] * x[a].
+
+    adj has [source, target] layout. We want activation to flow FROM source
+    TO target, so we need adj^T @ x (transpose before multiply).
+    """
+    return torch.sparse.mm(adj.t(), x.unsqueeze(1)).squeeze(1)
 
 
 def propagate(
@@ -114,15 +118,15 @@ def propagate_batch(
     # [V, B] for sparse @ dense
     impulse_re = impulses.to(device).to(torch.float32).transpose(0, 1).contiguous()
 
-    # Re: single bigram lookup
-    re = torch.sparse.mm(graph.syn_fwd, impulse_re)
+    # Re: single bigram lookup (transpose: source→target direction)
+    re = torch.sparse.mm(graph.syn_fwd.t(), impulse_re)
 
     # Im: T steps of semantic PPR
     im = torch.zeros_like(impulse_re)
     impulse_im = torch.zeros_like(impulse_re)
 
     for t in range(T):
-        im_spread = torch.sparse.mm(graph.sem_fwd, im)
+        im_spread = torch.sparse.mm(graph.sem_fwd.t(), im)
         if t >= depth and rho > 0.0:
             im_spread = im_spread + rho * re
         im = alpha * impulse_im + (1.0 - alpha) * damp * im_spread

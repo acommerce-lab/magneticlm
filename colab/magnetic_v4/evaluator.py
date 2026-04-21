@@ -244,9 +244,15 @@ def evaluate_generation(
             if cfg.gen_top_k > 0:
                 vals, idx = torch.topk(dist, min(cfg.gen_top_k, dist.numel()))
                 probs = vals / vals.sum().clamp(min=1e-9)
-                pick = int(idx[torch.multinomial(probs, 1).item()].item())
+                if probs.sum() < 1e-9:
+                    pick = int(idx[0].item())
+                else:
+                    pick = int(idx[torch.multinomial(probs, 1).item()].item())
             else:
-                pick = int(torch.multinomial(dist, 1).item())
+                if dist.sum() < 1e-9:
+                    pick = int(dist.argmax().item())
+                else:
+                    pick = int(torch.multinomial(dist, 1).item())
             ids.append(pick)
         text = " ".join(vocab.itos[i] for i in ids)
         out.append({"prompt": prompt, "generated": text})
@@ -299,10 +305,10 @@ def evaluate_graph_concepts(
         for w in set(ctx_ids):
             if w == vocab.unk_id:
                 continue
-            # Check forward neighbors of w
+            # Check forward neighbors of w (transpose: source→target)
             row = torch.zeros(V, device=device)
             row[w] = 1.0
-            fwd_scores = torch.sparse.mm(fwd, row.unsqueeze(1)).squeeze(1)
+            fwd_scores = torch.sparse.mm(fwd.t(), row.unsqueeze(1)).squeeze(1)
             _, fwd_top = torch.topk(fwd_scores, min(top_k, V))
             fwd_list = fwd_top.tolist()
             if tgt in fwd_list:
@@ -312,7 +318,7 @@ def evaluate_graph_concepts(
                     best_word = vocab.itos[w]
                     best_dir = "fwd"
             # Check backward neighbors of w
-            bwd_scores = torch.sparse.mm(bwd, row.unsqueeze(1)).squeeze(1)
+            bwd_scores = torch.sparse.mm(bwd.t(), row.unsqueeze(1)).squeeze(1)
             _, bwd_top = torch.topk(bwd_scores, min(top_k, V))
             bwd_list = bwd_top.tolist()
             if tgt in bwd_list:
