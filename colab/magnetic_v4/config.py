@@ -32,7 +32,8 @@ class Config:
     # ------------------------------------------------------------------
     # Graph: directional adjacency
     # ------------------------------------------------------------------
-    max_out_edges: int = 200        # per-node cap on forward edges (by weight)
+    max_out_edges: int = 200        # per-node cap on edges (ranked by PPMI)
+    min_ppmi: float = 0.5           # drop edges with PPMI below this (pure noise)
     cost_ceiling: float = 20.0      # clip costs above this (sanity)
 
     # ------------------------------------------------------------------

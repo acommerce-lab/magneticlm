@@ -80,9 +80,10 @@ def _top_k_per_row(
 def build_graph(stats: Stats, cfg) -> Graph:
     """Construct fwd/bwd sparse adjacency from stats.
 
-    Uses context pairs (symmetric window) so both directions are meaningful
-    — asymmetry emerges from the directional cost (a|b vs b|a), not from
-    an asymmetric pair collection.
+    Edge SELECTION uses PPMI (semantic surprise) so content-word links survive
+    the top-K filter; edge WEIGHTS use directional transition probabilities
+    (p(b|a) forward, p(a|b) backward) so signal strength is properly
+    asymmetric.
     """
     V = stats.vocab_size
     device = stats.unigram_counts.device
@@ -92,6 +93,19 @@ def build_graph(stats: Stats, cfg) -> Graph:
     counts = stats.ctx_counts
     uni = stats.unigram_counts
 
+    # ---- Compute PPMI for edge-selection scoring --------------------------
+    # PPMI(a,b) = max(0, log[ p(a,b) / (p(a)·p(b)) ])
+    # High PPMI = "surprising" co-occurrence = semantic link.
+    # Low PPMI = just both common = function-word pairing.
+    total_pairs = counts.sum().clamp(min=1.0)
+    p_ab = counts / total_pairs
+    uni_f = uni.to(torch.float32)
+    N = uni_f.sum().clamp(min=1.0)
+    p_a = uni_f[rows] / N
+    p_b = uni_f[cols] / N
+    pmi = torch.log((p_ab + 1e-12) / (p_a * p_b + 1e-12))
+    ppmi = pmi.clamp(min=0.0)
+
     cost_fwd, cost_bwd = directional_costs(
         rows, cols, counts, uni,
         smoothing=cfg.cost_smoothing,
@@ -100,13 +114,19 @@ def build_graph(stats: Stats, cfg) -> Graph:
     w_fwd = torch.exp(-cost_fwd)
     w_bwd = torch.exp(-cost_bwd)
 
-    # Top-K filtering per source row to bound out-degree
+    # Filter out low-PPMI noise first (pairs that are just coincidence)
+    min_ppmi = float(getattr(cfg, "min_ppmi", 0.5))
+    ppmi_mask = ppmi >= min_ppmi
+
+    # Top-K per source row — ranked by PPMI (semantic surprise).
+    # This keeps content-word links (king↔queen) from being drowned out
+    # by function-word transitions (king→the) at scale.
     if cfg.max_out_edges > 0:
-        keep_f = _top_k_per_row(rows, w_fwd, V, cfg.max_out_edges)
-        keep_b = _top_k_per_row(cols, w_bwd, V, cfg.max_out_edges)  # b is source for reverse
+        keep_f = _top_k_per_row(rows, ppmi, V, cfg.max_out_edges) & ppmi_mask
+        keep_b = _top_k_per_row(cols, ppmi, V, cfg.max_out_edges) & ppmi_mask
     else:
-        keep_f = torch.ones(rows.numel(), dtype=torch.bool, device=device)
-        keep_b = keep_f
+        keep_f = ppmi_mask
+        keep_b = ppmi_mask
 
     # Forward: a → b with weight w_fwd
     fwd_i = torch.stack([rows[keep_f], cols[keep_f]], dim=0)
