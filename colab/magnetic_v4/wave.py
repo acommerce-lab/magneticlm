@@ -61,28 +61,24 @@ def propagate(
     depth = int(cfg.reflection_depth)
     alpha = float(getattr(cfg, "wave_teleport", 0.15))
 
-    # Start purely real
     impulse_re = impulse.to(device).to(torch.float32).clone()
+
+    # Re channel: SINGLE matmul — direct bigram lookup p(next|current).
+    # No iteration, no teleport. This IS the bigram probability vector.
+    re = _sparse_mv(graph.syn_fwd, impulse_re)
+
+    # Im channel: T steps of PPR through semantic graph (multi-hop spreading)
+    im = torch.zeros_like(impulse_re)
     impulse_im = torch.zeros_like(impulse_re)
-    re = impulse_re.clone()
-    im = impulse_im.clone()
 
     hist_re = []
     hist_im = []
 
     for t in range(T):
-        # Dual-channel PPR: syntax graph carries Re, semantic graph carries Im
-        re_spread = _sparse_mv(graph.syn_fwd, re)
         im_spread = _sparse_mv(graph.sem_fwd, im)
-
-        # Reflection: real↔imaginary cross-talk (creative leap channel).
-        # Syntax-driven signal feeds into concept space, concept-driven
-        # signal feeds back into syntax space.
+        # Reflection: syntax informs concepts (Re → Im)
         if t >= depth and rho > 0.0:
-            re_spread = re_spread + rho * im
             im_spread = im_spread + rho * re
-
-        re = alpha * impulse_re + (1.0 - alpha) * damp * re_spread
         im = alpha * impulse_im + (1.0 - alpha) * damp * im_spread
 
         if track_history:
@@ -117,17 +113,18 @@ def propagate_batch(
 
     # [V, B] for sparse @ dense
     impulse_re = impulses.to(device).to(torch.float32).transpose(0, 1).contiguous()
+
+    # Re: single bigram lookup
+    re = torch.sparse.mm(graph.syn_fwd, impulse_re)
+
+    # Im: T steps of semantic PPR
+    im = torch.zeros_like(impulse_re)
     impulse_im = torch.zeros_like(impulse_re)
-    re = impulse_re.clone()
-    im = impulse_im.clone()
 
     for t in range(T):
-        re_spread = torch.sparse.mm(graph.syn_fwd, re)
         im_spread = torch.sparse.mm(graph.sem_fwd, im)
         if t >= depth and rho > 0.0:
-            re_spread = re_spread + rho * im
             im_spread = im_spread + rho * re
-        re = alpha * impulse_re + (1.0 - alpha) * damp * re_spread
         im = alpha * impulse_im + (1.0 - alpha) * damp * im_spread
 
     # back to [B, V] complex
