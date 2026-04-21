@@ -40,6 +40,7 @@ class Config:
     # ------------------------------------------------------------------
     wave_iters: int = 5             # propagation steps per inference
     wave_damping: float = 0.85      # per-step attenuation (stability)
+    wave_teleport: float = 0.15     # fraction that stays at original impulse (PPR-style)
     reflection_coef: float = 0.3    # how much signal flips real<->imag at deep nodes
     reflection_depth: int = 3       # after N steps, enable reflection
 

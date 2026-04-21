@@ -118,7 +118,29 @@ def build_graph(stats: Stats, cfg) -> Graph:
     bwd_v = w_bwd[keep_b]
     bwd_adj = torch.sparse_coo_tensor(bwd_i, bwd_v, (V, V)).coalesce()
 
+    # Row-normalize so each row sums to 1 (proper stochastic matrix).
+    # Without this, repeated sparse mat-vec converges to the stationary
+    # distribution of the graph (= frequency-based hubs dominate everything).
+    fwd_adj = _row_normalize_sparse(fwd_adj)
+    bwd_adj = _row_normalize_sparse(bwd_adj)
+
     return Graph(vocab_size=V, fwd_adj=fwd_adj, bwd_adj=bwd_adj)
+
+
+def _row_normalize_sparse(mat: torch.Tensor) -> torch.Tensor:
+    """Row-normalize a sparse COO matrix so each row sums to 1."""
+    mat = mat.coalesce()
+    indices = mat.indices()
+    values = mat.values()
+    if values.numel() == 0:
+        return mat
+    rows = indices[0]
+    V = mat.size(0)
+    row_sums = torch.zeros(V, device=values.device, dtype=values.dtype)
+    row_sums.scatter_add_(0, rows, values)
+    row_sums = row_sums.clamp(min=1e-9)
+    values_norm = values / row_sums[rows]
+    return torch.sparse_coo_tensor(indices, values_norm, mat.size()).coalesce()
 
 
 def graph_info(g: Graph) -> str:

@@ -59,32 +59,29 @@ def propagate(
     damp = float(cfg.wave_damping)
     rho = float(cfg.reflection_coef)
     depth = int(cfg.reflection_depth)
+    alpha = float(getattr(cfg, "wave_teleport", 0.15))
 
     # Start purely real
-    re = impulse.to(device).to(torch.float32).clone()
-    im = torch.zeros_like(re)
+    impulse_re = impulse.to(device).to(torch.float32).clone()
+    impulse_im = torch.zeros_like(impulse_re)
+    re = impulse_re.clone()
+    im = impulse_im.clone()
 
     hist_re = []
     hist_im = []
 
     for t in range(T):
-        # Forward pass of the real (contextual) signal
-        re_in = _sparse_mv(graph.fwd_adj, re)
-        # Backward pass of the imaginary (conceptual) signal
-        im_in = _sparse_mv(graph.bwd_adj, im)
+        # Personalized PageRank: teleport back to impulse each step
+        # z_new = α·impulse + (1-α)·damp·(adj @ z + reflection)
+        re_spread = _sparse_mv(graph.fwd_adj, re)
+        im_spread = _sparse_mv(graph.bwd_adj, im)
 
-        # Reflection kicks in once the wave has propagated into the "deep"
-        # (after `depth` steps). conj(z) = re - i·im, and multiplying by ρ
-        # converts some real signal back into imaginary at the current node
-        # — this is the "creative leap" channel.
         if t >= depth and rho > 0.0:
-            # Rotate 90°: new imaginary gets fed by the arriving real,
-            # and vice-versa (symmetric reflection).
-            re_in = re_in + rho * im           # im→re feedback
-            im_in = im_in + rho * re           # re→im feedback
+            re_spread = re_spread + rho * im
+            im_spread = im_spread + rho * re
 
-        re = damp * re_in
-        im = damp * im_in
+        re = alpha * impulse_re + (1.0 - alpha) * damp * re_spread
+        im = alpha * impulse_im + (1.0 - alpha) * damp * im_spread
 
         if track_history:
             hist_re.append(re.detach().cpu())
@@ -114,19 +111,22 @@ def propagate_batch(
     damp = float(cfg.wave_damping)
     rho = float(cfg.reflection_coef)
     depth = int(cfg.reflection_depth)
+    alpha = float(getattr(cfg, "wave_teleport", 0.15))
 
-    # Ensure shape [V, B] for sparse @ dense
-    re = impulses.to(device).to(torch.float32).transpose(0, 1).contiguous()   # [V, B]
-    im = torch.zeros_like(re)
+    # [V, B] for sparse @ dense
+    impulse_re = impulses.to(device).to(torch.float32).transpose(0, 1).contiguous()
+    impulse_im = torch.zeros_like(impulse_re)
+    re = impulse_re.clone()
+    im = impulse_im.clone()
 
     for t in range(T):
-        re_in = torch.sparse.mm(graph.fwd_adj, re)
-        im_in = torch.sparse.mm(graph.bwd_adj, im)
+        re_spread = torch.sparse.mm(graph.fwd_adj, re)
+        im_spread = torch.sparse.mm(graph.bwd_adj, im)
         if t >= depth and rho > 0.0:
-            re_in = re_in + rho * im
-            im_in = im_in + rho * re
-        re = damp * re_in
-        im = damp * im_in
+            re_spread = re_spread + rho * im
+            im_spread = im_spread + rho * re
+        re = alpha * impulse_re + (1.0 - alpha) * damp * re_spread
+        im = alpha * impulse_im + (1.0 - alpha) * damp * im_spread
 
     # back to [B, V] complex
     z = torch.complex(re.transpose(0, 1).contiguous(),

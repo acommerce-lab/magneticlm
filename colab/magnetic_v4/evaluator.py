@@ -248,6 +248,104 @@ def evaluate_generation(
     return out
 
 
+def evaluate_graph_concepts(
+    graph: Graph,
+    vocab: Vocab,
+    device: torch.device,
+    cases: Optional[List[Tuple[str, str]]] = None,
+    top_k: int = 50,
+) -> Dict:
+    """Graph Neighbor Recall: tests if the raw graph contains conceptual links.
+
+    For each OOD case (context, answer), checks whether 'answer' is among
+    the top-K graph neighbors of ANY context word. This measures GRAPH QUALITY
+    independently of scoring/propagation — if the answer isn't even a neighbor,
+    no scoring formula can save it.
+
+    This answers: "does the graph know that king→kingdom, paris→france?"
+    """
+    cases = cases or OOD_CLOZE
+    fwd = graph.fwd_adj.coalesce()
+    bwd = graph.bwd_adj.coalesce()
+    V = graph.vocab_size
+
+    found = 0
+    total = 0
+    details = []
+
+    for context, answer in cases:
+        ctx_ids = vocab.encode_line(context)
+        ans_ids = vocab.encode_line(answer)
+        if not ctx_ids or not ans_ids:
+            continue
+        tgt = ans_ids[0]
+        if tgt == vocab.unk_id:
+            details.append({
+                "context": context, "answer": answer,
+                "skipped": True, "reason": "unk",
+            })
+            continue
+
+        total += 1
+        best_rank = None
+        best_word = None
+        best_dir = None
+
+        for w in set(ctx_ids):
+            if w == vocab.unk_id:
+                continue
+            # Check forward neighbors of w
+            row = torch.zeros(V, device=device)
+            row[w] = 1.0
+            fwd_scores = torch.sparse.mm(fwd, row.unsqueeze(1)).squeeze(1)
+            _, fwd_top = torch.topk(fwd_scores, min(top_k, V))
+            fwd_list = fwd_top.tolist()
+            if tgt in fwd_list:
+                r = fwd_list.index(tgt) + 1
+                if best_rank is None or r < best_rank:
+                    best_rank = r
+                    best_word = vocab.itos[w]
+                    best_dir = "fwd"
+            # Check backward neighbors of w
+            bwd_scores = torch.sparse.mm(bwd, row.unsqueeze(1)).squeeze(1)
+            _, bwd_top = torch.topk(bwd_scores, min(top_k, V))
+            bwd_list = bwd_top.tolist()
+            if tgt in bwd_list:
+                r = bwd_list.index(tgt) + 1
+                if best_rank is None or r < best_rank:
+                    best_rank = r
+                    best_word = vocab.itos[w]
+                    best_dir = "bwd"
+
+        if best_rank is not None and best_rank <= top_k:
+            found += 1
+        details.append({
+            "context": context, "answer": answer,
+            "graph_rank": best_rank, "via_word": best_word,
+            "direction": best_dir,
+        })
+
+    recall = found / max(total, 1)
+    print(f"  [concept] Graph Neighbor Recall@{top_k}: {found}/{total} = {recall:.3f}")
+    for d in details:
+        if d.get("skipped"):
+            print(f"      [{d['context']!r}] -> SKIPPED ({d['reason']})")
+            continue
+        r = d["graph_rank"]
+        r_str = str(r) if r else f">{top_k}"
+        via = d.get("via_word", "?")
+        dir_ = d.get("direction", "?")
+        print(f"      [{d['context']!r}] -> '{d['answer']}' rank={r_str} via='{via}'({dir_})")
+
+    return {
+        "graph_recall": recall,
+        "found": found,
+        "total": total,
+        "top_k": top_k,
+        "details": details,
+    }
+
+
 def run_full_eval(
     graph: Graph,
     encoded_valid: List[np.ndarray],
@@ -271,7 +369,11 @@ def run_full_eval(
             print(f"    {k} = {v:.4f}")
 
     if cfg.eval_ood_cloze:
-        print("  [eval] OOD cloze...")
+        print("  [eval] Graph concept recall (raw graph quality)...")
+        results["graph_concepts"] = evaluate_graph_concepts(
+            graph, vocab, device,
+        )
+        print("  [eval] OOD cloze (end-to-end scoring)...")
         r = evaluate_ood_cloze(graph, vocab, cfg, device)
         results["ood"] = r
         n_skipped = sum(1 for d in r.get("ood_details", []) if d.get("skipped"))
