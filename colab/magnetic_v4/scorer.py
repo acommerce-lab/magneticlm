@@ -40,14 +40,21 @@ def score_magnitude(z: torch.Tensor, cfg) -> torch.Tensor:
 
 @register("projection")
 def score_projection(z: torch.Tensor, cfg) -> torch.Tensor:
-    """Linear projection onto context+concept axes. Allows sign."""
-    re, im = z.real, z.imag
+    """Mixture of independently-normalized Re and Im distributions.
+
+    Re (syntactic PPR) ≈ p(next | context through grammar graph).
+    Im (semantic PPR)  ≈ p(next | context through concept graph).
+    Mix: (1-λ)·Re_norm + λ·Im_norm where λ = concept_weight/(context+concept).
+    """
+    re = z.real.clamp(min=0.0)
+    im = z.imag.clamp(min=0.0)
     w_re = float(cfg.context_weight)
     w_im = float(cfg.concept_weight)
-    scores = w_re * re + w_im * im
-    # Shift to non-negative
-    scores = scores - scores.min(dim=-1, keepdim=True).values
-    return _normalize(scores.clamp(min=0.0))
+    re_norm = _normalize(re)
+    im_norm = _normalize(im)
+    total_w = max(w_re + w_im, 1e-9)
+    scores = (w_re / total_w) * re_norm + (w_im / total_w) * im_norm
+    return _normalize(scores)
 
 
 @register("hybrid")

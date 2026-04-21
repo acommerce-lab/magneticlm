@@ -48,9 +48,9 @@ class Config:
     # ------------------------------------------------------------------
     # Scoring (how to convert complex field to P(next token))
     # ------------------------------------------------------------------
-    scoring_method: str = "magnitude"      # magnitude | projection | hybrid
-    context_weight: float = 1.0            # weight on Re(z) for next-token
-    concept_weight: float = 0.5            # weight on Im(z) for next-token
+    scoring_method: str = "projection"     # projection | magnitude | hybrid
+    context_weight: float = 0.85           # weight on Re(z) — syntactic channel
+    concept_weight: float = 0.15           # weight on Im(z) — semantic channel
     mask_unk_in_eval: bool = True          # skip <unk> in generation/OOD
 
     # ------------------------------------------------------------------

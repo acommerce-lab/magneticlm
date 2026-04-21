@@ -346,6 +346,59 @@ def evaluate_graph_concepts(
     }
 
 
+def evaluate_layer_diagnostics(
+    graph: Graph,
+    encoded: List[np.ndarray],
+    vocab: Vocab,
+    cfg,
+    device: torch.device,
+) -> Dict:
+    """Isolated eval of each layer: syntax-only PPL + semantic-only PPL.
+
+    Tests each channel independently so we know WHERE the problem is:
+      - Syntax PPL: score using only Re (grammar graph) — should approach bigram PPL
+      - Semantic PPL: score using only Im (concept graph) — baseline for concept quality
+    """
+    from copy import copy
+
+    results = {}
+
+    # --- Syntax-only: context_weight=1, concept_weight=0, reflection=0 ---
+    cfg_syn = copy(cfg)
+    cfg_syn.context_weight = 1.0
+    cfg_syn.concept_weight = 0.0
+    cfg_syn.reflection_coef = 0.0
+    cfg_syn.scoring_method = "projection"
+
+    arrs = [a for a in encoded if a.size > 1]
+    if arrs:
+        ppl_syn = evaluate_ppl(graph, encoded, vocab, cfg_syn, device, max_tokens=50000)
+        hr_syn = evaluate_hit_rate(graph, encoded, vocab, cfg_syn, device,
+                                   max_tokens=50000)
+        results["syntax_only"] = {"ppl": ppl_syn, "hit_rate": hr_syn}
+        print(f"    [syntax-only]  PPL={ppl_syn['ppl']:.2f}  "
+              f"hit@1={hr_syn.get('hit@1', 0):.4f}  "
+              f"hit@5={hr_syn.get('hit@5', 0):.4f}")
+
+    # --- Semantic-only: context_weight=0, concept_weight=1, reflection=0 ---
+    cfg_sem = copy(cfg)
+    cfg_sem.context_weight = 0.0
+    cfg_sem.concept_weight = 1.0
+    cfg_sem.reflection_coef = 0.0
+    cfg_sem.scoring_method = "projection"
+
+    if arrs:
+        ppl_sem = evaluate_ppl(graph, encoded, vocab, cfg_sem, device, max_tokens=50000)
+        hr_sem = evaluate_hit_rate(graph, encoded, vocab, cfg_sem, device,
+                                   max_tokens=50000)
+        results["semantic_only"] = {"ppl": ppl_sem, "hit_rate": hr_sem}
+        print(f"    [semantic-only] PPL={ppl_sem['ppl']:.2f}  "
+              f"hit@1={hr_sem.get('hit@1', 0):.4f}  "
+              f"hit@5={hr_sem.get('hit@5', 0):.4f}")
+
+    return results
+
+
 def run_full_eval(
     graph: Graph,
     encoded_valid: List[np.ndarray],
@@ -355,8 +408,14 @@ def run_full_eval(
 ) -> Dict:
     results: Dict = {}
 
+    # --- Layer diagnostics: syntax-only and semantic-only ---
+    print("  [eval] Layer diagnostics (isolated channels)...")
+    results["layer_diagnostics"] = evaluate_layer_diagnostics(
+        graph, encoded_valid, vocab, cfg, device,
+    )
+
     if cfg.eval_ppl:
-        print("  [eval] PPL...")
+        print("  [eval] Combined PPL...")
         r = evaluate_ppl(graph, encoded_valid, vocab, cfg, device)
         results["ppl"] = r
         print(f"    PPL = {r['ppl']:.2f} on {r['n_tokens']} tokens (in {r.get('time_s', 0):.1f}s)")
