@@ -82,66 +82,73 @@ def _top_k_per_row(
 
 
 def build_graph(stats: Stats, cfg) -> Graph:
-    """Construct fwd/bwd sparse adjacency from stats.
+    """Build dual-channel graph: syntax from bigram, semantics from PPMI.
 
-    Edge SELECTION uses PPMI (semantic surprise) so content-word links survive
-    the top-K filter; edge WEIGHTS use directional transition probabilities
-    (p(b|a) forward, p(a|b) backward) so signal strength is properly
-    asymmetric.
+    Syntax channel (syn_fwd/syn_bwd):
+      Built from DIRECTIONAL bigram pairs (A→B, window=1).
+      These capture "what word follows what" — proper for next-token.
+      Filtered by top-K raw transition probability.
+
+    Semantic channel (sem_fwd/sem_bwd):
+      Built from SYMMETRIC context pairs (window=5).
+      Filtered by PPMI (semantic surprise) to keep conceptual links.
     """
     V = stats.vocab_size
     device = stats.unigram_counts.device
-
-    rows = stats.ctx_rows
-    cols = stats.ctx_cols
-    counts = stats.ctx_counts
     uni = stats.unigram_counts
+    K = cfg.max_out_edges
 
-    # ---- Compute PPMI for edge-selection scoring --------------------------
-    # PPMI(a,b) = max(0, log[ p(a,b) / (p(a)·p(b)) ])
-    # High PPMI = "surprising" co-occurrence = semantic link.
-    # Low PPMI = just both common = function-word pairing.
-    total_pairs = counts.sum().clamp(min=1.0)
-    p_ab = counts / total_pairs
+    # ==================================================================
+    # SYNTAX LAYER: from bigram pairs (directional A→B)
+    # ==================================================================
+    bg_r, bg_c, bg_cnt = stats.bg_rows, stats.bg_cols, stats.bg_counts
+    bg_cost_fwd, bg_cost_bwd = directional_costs(
+        bg_r, bg_c, bg_cnt, uni,
+        smoothing=cfg.cost_smoothing, ceiling=cfg.cost_ceiling,
+    )
+    bg_w_fwd = torch.exp(-bg_cost_fwd)
+    bg_w_bwd = torch.exp(-bg_cost_bwd)
+
+    if K > 0:
+        keep_syn_f = _top_k_per_row(bg_r, bg_w_fwd, V, K)
+        keep_syn_b = _top_k_per_row(bg_c, bg_w_bwd, V, K)
+    else:
+        keep_syn_f = torch.ones(bg_r.numel(), dtype=torch.bool, device=device)
+        keep_syn_b = keep_syn_f
+
+    syn_fwd = _build_sparse(bg_r, bg_c, bg_w_fwd, keep_syn_f, V)
+    syn_bwd = _build_sparse(bg_c, bg_r, bg_w_bwd, keep_syn_b, V)
+
+    # ==================================================================
+    # SEMANTIC LAYER: from context pairs (symmetric, PPMI-filtered)
+    # ==================================================================
+    ctx_r, ctx_c, ctx_cnt = stats.ctx_rows, stats.ctx_cols, stats.ctx_counts
+
+    total_pairs = ctx_cnt.sum().clamp(min=1.0)
+    p_ab = ctx_cnt / total_pairs
     uni_f = uni.to(torch.float32)
     N = uni_f.sum().clamp(min=1.0)
-    p_a = uni_f[rows] / N
-    p_b = uni_f[cols] / N
+    p_a = uni_f[ctx_r] / N
+    p_b = uni_f[ctx_c] / N
     pmi = torch.log((p_ab + 1e-12) / (p_a * p_b + 1e-12))
     ppmi = pmi.clamp(min=0.0)
 
-    cost_fwd, cost_bwd = directional_costs(
-        rows, cols, counts, uni,
-        smoothing=cfg.cost_smoothing,
-        ceiling=cfg.cost_ceiling,
+    ctx_cost_fwd, ctx_cost_bwd = directional_costs(
+        ctx_r, ctx_c, ctx_cnt, uni,
+        smoothing=cfg.cost_smoothing, ceiling=cfg.cost_ceiling,
     )
-    w_fwd = torch.exp(-cost_fwd)
-    w_bwd = torch.exp(-cost_bwd)
+    ctx_w_fwd = torch.exp(-ctx_cost_fwd)
+    ctx_w_bwd = torch.exp(-ctx_cost_bwd)
 
-    # ---- SYNTACTIC edges: top-K by raw transition probability ----
-    # These carry grammar: "the" after "ruled", "is" after "water", etc.
-    K = cfg.max_out_edges
-    if K > 0:
-        keep_syn_f = _top_k_per_row(rows, w_fwd, V, K)
-        keep_syn_b = _top_k_per_row(cols, w_bwd, V, K)
-    else:
-        keep_syn_f = torch.ones(rows.numel(), dtype=torch.bool, device=device)
-        keep_syn_b = keep_syn_f
-
-    syn_fwd = _build_sparse(rows, cols, w_fwd, keep_syn_f, V)
-    syn_bwd = _build_sparse(cols, rows, w_bwd, keep_syn_b, V)
-
-    # ---- SEMANTIC edges: top-K by PPMI ----
-    # These carry meaning: king↔queen, paris↔france, sky↔blue
     min_ppmi = float(getattr(cfg, "min_ppmi", 0.5))
     ppmi_mask = ppmi >= min_ppmi
     if K > 0:
-        keep_sem = _top_k_per_row(rows, ppmi, V, K) & ppmi_mask
+        keep_sem = _top_k_per_row(ctx_r, ppmi, V, K) & ppmi_mask
     else:
         keep_sem = ppmi_mask
 
-    sem_fwd = _build_sparse(rows, cols, w_fwd, keep_sem, V)
-    sem_bwd = _build_sparse(cols, rows, w_bwd, keep_sem, V)
+    sem_fwd = _build_sparse(ctx_r, ctx_c, ctx_w_fwd, keep_sem, V)
+    sem_bwd = _build_sparse(ctx_c, ctx_r, ctx_w_bwd, keep_sem, V)
 
     # Row-normalize both so propagation is a proper random walk
     syn_fwd = _row_normalize_sparse(syn_fwd)

@@ -39,16 +39,20 @@ OOD_CLOZE = [
 
 
 def _one_hot(tokens: List[int], V: int, device: torch.device) -> torch.Tensor:
-    """Build an impulse that weights the most recent context more heavily."""
+    """Build impulse focusing on the LAST token (most relevant for bigram).
+
+    Also gives diminishing weight to prior context for multi-hop PPR walks.
+    """
     x = torch.zeros(V, dtype=torch.float32, device=device)
     if not tokens:
         return x
-    # Exponential recency weighting: most recent = 1.0, each earlier ×0.7
-    w = 1.0
-    for t in reversed(tokens[-8:]):   # cap context length
+    # Last token gets dominant weight
+    x[int(tokens[-1])] += 1.0
+    # Prior context gets small diminishing weight (helps multi-hop)
+    w = 0.3
+    for t in reversed(tokens[-8:-1]):
         x[int(t)] += w
-        w *= 0.7
-    # Normalize
+        w *= 0.5
     s = x.sum().clamp(min=1e-9)
     return x / s
 
@@ -60,10 +64,11 @@ def _build_batch_impulses(contexts: List[List[int]], V: int, device: torch.devic
     for i, ctx in enumerate(contexts):
         if not ctx:
             continue
-        w = 1.0
-        for t in reversed(ctx[-8:]):
+        imp[i, int(ctx[-1])] += 1.0
+        w = 0.3
+        for t in reversed(ctx[-8:-1]):
             imp[i, int(t)] += w
-            w *= 0.7
+            w *= 0.5
         s = imp[i].sum().clamp(min=1e-9)
         imp[i] = imp[i] / s
     return imp
