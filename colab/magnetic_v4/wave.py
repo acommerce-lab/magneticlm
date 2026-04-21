@@ -71,11 +71,13 @@ def propagate(
     hist_im = []
 
     for t in range(T):
-        # Personalized PageRank: teleport back to impulse each step
-        # z_new = α·impulse + (1-α)·damp·(adj @ z + reflection)
-        re_spread = _sparse_mv(graph.fwd_adj, re)
-        im_spread = _sparse_mv(graph.bwd_adj, im)
+        # Dual-channel PPR: syntax graph carries Re, semantic graph carries Im
+        re_spread = _sparse_mv(graph.syn_fwd, re)
+        im_spread = _sparse_mv(graph.sem_fwd, im)
 
+        # Reflection: real↔imaginary cross-talk (creative leap channel).
+        # Syntax-driven signal feeds into concept space, concept-driven
+        # signal feeds back into syntax space.
         if t >= depth and rho > 0.0:
             re_spread = re_spread + rho * im
             im_spread = im_spread + rho * re
@@ -120,8 +122,8 @@ def propagate_batch(
     im = impulse_im.clone()
 
     for t in range(T):
-        re_spread = torch.sparse.mm(graph.fwd_adj, re)
-        im_spread = torch.sparse.mm(graph.bwd_adj, im)
+        re_spread = torch.sparse.mm(graph.syn_fwd, re)
+        im_spread = torch.sparse.mm(graph.sem_fwd, im)
         if t >= depth and rho > 0.0:
             re_spread = re_spread + rho * im
             im_spread = im_spread + rho * re

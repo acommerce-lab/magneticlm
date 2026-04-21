@@ -19,16 +19,20 @@ from .stats import Stats, directional_costs
 @dataclass
 class Graph:
     vocab_size: int
-    # Forward: source row, target col, weight = exp(-cost_fwd)
-    fwd_adj: torch.Tensor   # sparse_coo [V, V]
-    # Backward: source row, target col, weight = exp(-cost_bwd)
-    bwd_adj: torch.Tensor   # sparse_coo [V, V]
+    # Syntactic: p(b|a) based edges for grammar flow (Re channel)
+    syn_fwd: torch.Tensor   # sparse_coo [V, V]
+    syn_bwd: torch.Tensor   # sparse_coo [V, V]
+    # Semantic: PPMI-based edges for concept flow (Im channel)
+    sem_fwd: torch.Tensor   # sparse_coo [V, V]
+    sem_bwd: torch.Tensor   # sparse_coo [V, V]
 
     def to(self, device: torch.device) -> "Graph":
         return Graph(
             vocab_size=self.vocab_size,
-            fwd_adj=self.fwd_adj.to(device),
-            bwd_adj=self.bwd_adj.to(device),
+            syn_fwd=self.syn_fwd.to(device),
+            syn_bwd=self.syn_bwd.to(device),
+            sem_fwd=self.sem_fwd.to(device),
+            sem_bwd=self.sem_bwd.to(device),
         )
 
 
@@ -114,37 +118,51 @@ def build_graph(stats: Stats, cfg) -> Graph:
     w_fwd = torch.exp(-cost_fwd)
     w_bwd = torch.exp(-cost_bwd)
 
-    # Filter out low-PPMI noise first (pairs that are just coincidence)
+    # ---- SYNTACTIC edges: top-K by raw transition probability ----
+    # These carry grammar: "the" after "ruled", "is" after "water", etc.
+    K = cfg.max_out_edges
+    if K > 0:
+        keep_syn_f = _top_k_per_row(rows, w_fwd, V, K)
+        keep_syn_b = _top_k_per_row(cols, w_bwd, V, K)
+    else:
+        keep_syn_f = torch.ones(rows.numel(), dtype=torch.bool, device=device)
+        keep_syn_b = keep_syn_f
+
+    syn_fwd = _build_sparse(rows, cols, w_fwd, keep_syn_f, V)
+    syn_bwd = _build_sparse(cols, rows, w_bwd, keep_syn_b, V)
+
+    # ---- SEMANTIC edges: top-K by PPMI ----
+    # These carry meaning: king↔queen, paris↔france, sky↔blue
     min_ppmi = float(getattr(cfg, "min_ppmi", 0.5))
     ppmi_mask = ppmi >= min_ppmi
-
-    # Top-K per source row — ranked by PPMI (semantic surprise).
-    # This keeps content-word links (king↔queen) from being drowned out
-    # by function-word transitions (king→the) at scale.
-    if cfg.max_out_edges > 0:
-        keep_f = _top_k_per_row(rows, ppmi, V, cfg.max_out_edges) & ppmi_mask
-        keep_b = _top_k_per_row(cols, ppmi, V, cfg.max_out_edges) & ppmi_mask
+    if K > 0:
+        keep_sem = _top_k_per_row(rows, ppmi, V, K) & ppmi_mask
     else:
-        keep_f = ppmi_mask
-        keep_b = ppmi_mask
+        keep_sem = ppmi_mask
 
-    # Forward: a → b with weight w_fwd
-    fwd_i = torch.stack([rows[keep_f], cols[keep_f]], dim=0)
-    fwd_v = w_fwd[keep_f]
-    fwd_adj = torch.sparse_coo_tensor(fwd_i, fwd_v, (V, V)).coalesce()
+    sem_fwd = _build_sparse(rows, cols, w_fwd, keep_sem, V)
+    sem_bwd = _build_sparse(cols, rows, w_bwd, keep_sem, V)
 
-    # Backward: b → a (i.e. row=b, col=a) with weight w_bwd
-    bwd_i = torch.stack([cols[keep_b], rows[keep_b]], dim=0)
-    bwd_v = w_bwd[keep_b]
-    bwd_adj = torch.sparse_coo_tensor(bwd_i, bwd_v, (V, V)).coalesce()
+    # Row-normalize both so propagation is a proper random walk
+    syn_fwd = _row_normalize_sparse(syn_fwd)
+    syn_bwd = _row_normalize_sparse(syn_bwd)
+    sem_fwd = _row_normalize_sparse(sem_fwd)
+    sem_bwd = _row_normalize_sparse(sem_bwd)
 
-    # Row-normalize so each row sums to 1 (proper stochastic matrix).
-    # Without this, repeated sparse mat-vec converges to the stationary
-    # distribution of the graph (= frequency-based hubs dominate everything).
-    fwd_adj = _row_normalize_sparse(fwd_adj)
-    bwd_adj = _row_normalize_sparse(bwd_adj)
+    return Graph(
+        vocab_size=V,
+        syn_fwd=syn_fwd, syn_bwd=syn_bwd,
+        sem_fwd=sem_fwd, sem_bwd=sem_bwd,
+    )
 
-    return Graph(vocab_size=V, fwd_adj=fwd_adj, bwd_adj=bwd_adj)
+
+def _build_sparse(
+    rows: torch.Tensor, cols: torch.Tensor,
+    vals: torch.Tensor, mask: torch.Tensor, V: int,
+) -> torch.Tensor:
+    i = torch.stack([rows[mask], cols[mask]], dim=0)
+    v = vals[mask]
+    return torch.sparse_coo_tensor(i, v, (V, V)).coalesce()
 
 
 def _row_normalize_sparse(mat: torch.Tensor) -> torch.Tensor:
@@ -164,6 +182,8 @@ def _row_normalize_sparse(mat: torch.Tensor) -> torch.Tensor:
 
 
 def graph_info(g: Graph) -> str:
-    f_nnz = int(g.fwd_adj._nnz())
-    b_nnz = int(g.bwd_adj._nnz())
-    return f"V={g.vocab_size}  fwd_edges={f_nnz:,}  bwd_edges={b_nnz:,}"
+    sf = int(g.syn_fwd._nnz())
+    sb = int(g.syn_bwd._nnz())
+    mf = int(g.sem_fwd._nnz())
+    mb = int(g.sem_bwd._nnz())
+    return (f"V={g.vocab_size}  syn={sf:,}/{sb:,}  sem={mf:,}/{mb:,}")

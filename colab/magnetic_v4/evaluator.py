@@ -265,8 +265,8 @@ def evaluate_graph_concepts(
     This answers: "does the graph know that king→kingdom, paris→france?"
     """
     cases = cases or OOD_CLOZE
-    fwd = graph.fwd_adj.coalesce()
-    bwd = graph.bwd_adj.coalesce()
+    fwd = graph.sem_fwd.coalesce()
+    bwd = graph.sem_bwd.coalesce()
     V = graph.vocab_size
 
     found = 0
