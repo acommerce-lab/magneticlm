@@ -17,6 +17,8 @@ from .config import Config
 from .data import load_dataset
 from .evaluator import run_full_eval
 from .graph import build_graph, graph_info
+from .kn import build_kn
+from .cache import build_concept_cache
 from .resources import Monitor, Resources, detect, setup_cuda_tuning
 from .stats import Stats, build_stats
 from .tokenizer import build_vocab, encode_stream
@@ -81,17 +83,39 @@ def run_pipeline(cfg: Config) -> Dict:
     t0 = time.time()
     graph = build_graph(stats, cfg)
     print(f"  {graph_info(graph)}  ({time.time()-t0:.1f}s)")
-    # Stats no longer needed in memory after graph built
+    monitor.snapshot("after-graph")
+
+    # ---------- KN-5gram ----------
+    print("Building KN-5gram...")
+    t0 = time.time()
+    kn_model = build_kn(encoded_train, vocab.size, cfg, resources.primary_device)
+    print(f"  KN built in {time.time()-t0:.1f}s")
+    monitor.snapshot("after-kn")
+
+    # ---------- Concept cache (PPMI trigger table) ----------
+    print("Building concept cache...")
+    t0 = time.time()
+    ccache = build_concept_cache(
+        stats.ctx_rows, stats.ctx_cols, stats.ctx_counts,
+        stats.unigram_counts, vocab.size,
+        K=cfg.concept_cache_k, device=resources.primary_device,
+        min_ppmi=cfg.min_ppmi,
+    )
+    print(f"  concept cache built in {time.time()-t0:.1f}s")
+
     del stats
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    monitor.snapshot("after-graph")
+    monitor.snapshot("after-caches")
 
     # ---------- Evaluation ----------
     print("Running evaluation...")
     t0 = time.time()
-    results = run_full_eval(graph, encoded_valid, vocab, cfg, resources.primary_device)
+    results = run_full_eval(
+        graph, encoded_valid, vocab, cfg, resources.primary_device,
+        kn_model=kn_model, ccache=ccache,
+    )
     print(f"  eval done in {time.time()-t0:.1f}s")
     monitor.snapshot("post-eval")
 
