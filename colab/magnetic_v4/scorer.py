@@ -40,11 +40,11 @@ def score_magnitude(z: torch.Tensor, cfg) -> torch.Tensor:
 
 @register("projection")
 def score_projection(z: torch.Tensor, cfg) -> torch.Tensor:
-    """Mixture of independently-normalized Re and Im distributions.
+    """Mixture of independently-normalized Re and Im + uniform floor.
 
     Re (syntactic PPR) ≈ p(next | context through grammar graph).
     Im (semantic PPR)  ≈ p(next | context through concept graph).
-    Mix: (1-λ)·Re_norm + λ·Im_norm where λ = concept_weight/(context+concept).
+    Floor ensures no token gets zero probability (fixes PPL for sparse graphs).
     """
     re = z.real.clamp(min=0.0)
     im = z.imag.clamp(min=0.0)
@@ -54,6 +54,10 @@ def score_projection(z: torch.Tensor, cfg) -> torch.Tensor:
     im_norm = _normalize(im)
     total_w = max(w_re + w_im, 1e-9)
     scores = (w_re / total_w) * re_norm + (w_im / total_w) * im_norm
+    # Uniform floor: ensure every token has non-zero probability
+    V = scores.shape[-1]
+    eps = 0.05
+    scores = (1.0 - eps) * scores + eps * (1.0 / max(V, 1))
     return _normalize(scores)
 
 
