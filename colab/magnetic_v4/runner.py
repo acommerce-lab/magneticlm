@@ -17,8 +17,6 @@ from .config import Config
 from .data import load_dataset
 from .evaluator import run_full_eval
 from .graph import build_graph, graph_info
-from .kn import build_kn
-from .cache import build_concept_cache, build_directional_subs
 from .resources import Monitor, Resources, detect, setup_cuda_tuning
 from .stats import Stats, build_stats
 from .tokenizer import build_vocab, encode_stream
@@ -83,47 +81,17 @@ def run_pipeline(cfg: Config) -> Dict:
     t0 = time.time()
     graph = build_graph(stats, cfg)
     print(f"  {graph_info(graph)}  ({time.time()-t0:.1f}s)")
-    monitor.snapshot("after-graph")
-
-    # ---------- KN-5gram ----------
-    print("Building KN-5gram...")
-    t0 = time.time()
-    kn_model = build_kn(encoded_train, vocab.size, cfg, resources.primary_device)
-    print(f"  KN built in {time.time()-t0:.1f}s")
-    monitor.snapshot("after-kn")
-
-    # ---------- Concept cache (PPMI trigger table) ----------
-    print("Building concept cache (distributional)...")
-    t0 = time.time()
-    ccache = build_concept_cache(
-        stats.ctx_rows, stats.ctx_cols, stats.ctx_counts,
-        stats.unigram_counts, vocab.size,
-        K=cfg.concept_cache_k, device=resources.primary_device,
-        min_ppmi=cfg.min_ppmi,
-    )
-    print(f"  concept cache built in {time.time()-t0:.1f}s")
-
-    print("Building directional substitution tables...")
-    t0 = time.time()
-    dir_subs = build_directional_subs(
-        stats.bg_rows, stats.bg_cols, vocab.size,
-        K=cfg.concept_cache_k, device=resources.primary_device,
-    )
-    print(f"  dir_subs built in {time.time()-t0:.1f}s")
-
+    # Stats no longer needed in memory after graph built
     del stats
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    monitor.snapshot("after-caches")
+    monitor.snapshot("after-graph")
 
     # ---------- Evaluation ----------
     print("Running evaluation...")
     t0 = time.time()
-    results = run_full_eval(
-        graph, encoded_valid, vocab, cfg, resources.primary_device,
-        kn_model=kn_model, ccache=ccache, dir_subs=dir_subs,
-    )
+    results = run_full_eval(graph, encoded_valid, vocab, cfg, resources.primary_device)
     print(f"  eval done in {time.time()-t0:.1f}s")
     monitor.snapshot("post-eval")
 

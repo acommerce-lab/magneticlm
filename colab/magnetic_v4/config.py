@@ -54,22 +54,8 @@ class Config:
     mask_unk_in_eval: bool = True          # skip <unk> in generation/OOD
 
     # ------------------------------------------------------------------
-    # KN-5gram statistical base
+    # Evaluation
     # ------------------------------------------------------------------
-    kn_max_order: int = 5               # up to 5-gram
-    kn_chunk_size: int = 500_000        # sentences per build chunk (memory bound)
-
-    # ------------------------------------------------------------------
-    # Statistical cache (decay — boosts recent tokens)
-    # ------------------------------------------------------------------
-    stat_cache_window: int = 3000       # tokens to remember
-    stat_cache_lambda: float = 0.15     # mix weight with KN base
-
-    # ------------------------------------------------------------------
-    # Conceptual cache (PPMI trigger — boosts semantic neighbors)
-    # ------------------------------------------------------------------
-    concept_cache_k: int = 30           # top-K PPMI neighbors per context word
-    concept_cache_lambda: float = 0.10  # mix weight for concept boost
     eval_ppl: bool = True
     eval_hit_rate: bool = True
     eval_ood_cloze: bool = True
