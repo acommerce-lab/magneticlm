@@ -54,7 +54,7 @@ def build(encoded: List[np.ndarray], V: int, max_order: int, device: torch.devic
         ng_counts[order] = torch.from_numpy(counts_np[si]).to(device)
         n1_all += int((counts_np == 1).sum())
         n2_all += int((counts_np == 2).sum())
-        n3_all += int((counts_np >= 3).sum())
+        n3_all += int((counts_np == 3).sum())
 
         # Per-context aggregates
         grp: Dict[int, List[int]] = {}
@@ -99,6 +99,39 @@ def build(encoded: List[np.ndarray], V: int, max_order: int, device: torch.devic
         uniq = torch.unique(t[:-1] * V + t[1:])
         cont.scatter_add_(0, (uniq % V).long(), torch.ones(uniq.numel(), dtype=torch.float32, device=device))
 
+    # Build sparse bigram transition matrix T[V,V] for fast adoption
+    bg_trans = None
+    if ng_keys[1] is not None:
+        idx = torch.stack([
+            (ng_keys[1] // _PRIMES[1]).to(torch.int64) % V,  # approximate source
+            torch.zeros_like(ng_keys[1])  # placeholder
+        ])
+        # Actually rebuild from raw bigrams properly
+        bg_rows_list = []
+        bg_cols_list = []
+        bg_counts_list = []
+        for arr in encoded:
+            if arr.size < 2:
+                continue
+            t = torch.from_numpy(arr.astype(np.int64)).to(device)
+            bg_rows_list.append(t[:-1])
+            bg_cols_list.append(t[1:])
+        if bg_rows_list:
+            all_r = torch.cat(bg_rows_list)
+            all_c = torch.cat(bg_cols_list)
+            pair_keys = all_r * V + all_c
+            uniq, counts_u = torch.unique(pair_keys, return_counts=True)
+            r_u = (uniq // V).long()
+            c_u = (uniq % V).long()
+            w_u = counts_u.float()
+            # Row-normalize
+            row_sums = torch.zeros(V, dtype=torch.float32, device=device)
+            row_sums.scatter_add_(0, r_u, w_u)
+            w_norm = w_u / row_sums[r_u].clamp(min=1.0)
+            bg_trans = torch.sparse_coo_tensor(
+                torch.stack([r_u, c_u]), w_norm, (V, V)
+            ).coalesce()
+
     print(f"  KN-{max_order}: D1={D1:.3f} D2={D2:.3f} D3={D3:.3f}")
     return dict(
         max_order=max_order, V=V, device=device,
@@ -108,6 +141,7 @@ def build(encoded: List[np.ndarray], V: int, max_order: int, device: torch.devic
         D1=D1, D2=D2, D3=D3,
         cont=cont, total_ub=int(cont.sum().item()),
         primes=torch.tensor(_PRIMES[:max_order + 1], dtype=torch.int64, device=device),
+        bg_trans=bg_trans,
     )
 
 

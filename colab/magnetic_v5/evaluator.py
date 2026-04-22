@@ -40,18 +40,32 @@ def _decay_boost(history: List[int], V: int, device: torch.device) -> torch.Tens
 
 
 def _adoption_dist(kn: Dict, subs: Dict, current: int, context: List[int], V: int, device: torch.device) -> torch.Tensor:
-    """Build adoption distribution: KN children of successor-substitutes."""
-    adoption = torch.zeros(V, dtype=torch.float32, device=device)
-    sub_ids = subs["succ_ids"][current]
-    sub_wts = subs["succ_wts"][current]
-    for j in range(subs["K"]):
-        sw = float(sub_wts[j].item())
-        if sw < 1e-6:
-            break
-        sub_w = int(sub_ids[j].item())
-        sub_ctx = context[:-1] + [sub_w] if context else [sub_w]
-        sub_dist = kn_score(kn, sub_ctx)
-        adoption = adoption + sw * sub_dist
+    """Build adoption distribution via sparse bigram matrix — no Python loops.
+
+    Uses pre-built bg_trans[V,V]: one sparse matmul instead of K calls to score_all.
+    """
+    bg = kn.get("bg_trans")
+    if bg is None:
+        return torch.zeros(V, dtype=torch.float32, device=device)
+
+    sub_ids = subs["succ_ids"][current]  # [K]
+    sub_wts = subs["succ_wts"][current]  # [K]
+
+    # Find active substitutes
+    active = sub_wts > 1e-6
+    if not active.any():
+        return torch.zeros(V, dtype=torch.float32, device=device)
+
+    a_ids = sub_ids[active]   # [A]
+    a_wts = sub_wts[active]   # [A]
+
+    # Selector vector: one-hot weighted by substitute weights
+    selector = torch.zeros(V, dtype=torch.float32, device=device)
+    selector.scatter_add_(0, a_ids.long(), a_wts)
+
+    # adoption = selector @ bg_trans.T = weighted sum of substitute bigram rows
+    adoption = torch.sparse.mm(bg.t(), selector.unsqueeze(1)).squeeze(1)
+
     s = adoption.sum()
     if s > 1e-9:
         adoption = adoption / s
