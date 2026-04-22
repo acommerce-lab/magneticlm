@@ -1,19 +1,15 @@
-"""Modified Kneser-Ney 5-gram on GPU.
+"""Modified Kneser-Ney 5-gram on GPU — correct backoff weights.
 
-Single responsibility: build n-gram count tables from encoded data,
-compute D1/D2/D3+ discounts, score P(next | context) in batches.
-
-Storage: polynomial-hashed keys in sorted GPU tensors; O(log n) lookup
-via torch.searchsorted. Memory-bounded chunked build for 1M+ corpora.
+Fixes from v1: proper per-context aggregates (c1, c2, uf) and
+λ(ctx) = (D1·c1 + D2·c2 + D3·(uf-c1-c2)) / total.
 """
 
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
 
-# Polynomial hash primes (proven collision-free for V≤50K up to 9-gram)
 _PRIMES = [1, 10007, 100003, 1000003, 10000019, 100000007,
            1000000007, 10000000019, 100000000003]
 
@@ -23,7 +19,6 @@ class KNModel:
     max_order: int
     vocab_size: int
     device: torch.device
-    # Per-order tables (index 0 unused; 1=bigram context, etc.)
     ng_keys: List[Optional[torch.Tensor]]
     ng_counts: List[Optional[torch.Tensor]]
     ctx_keys: List[Optional[torch.Tensor]]
@@ -31,13 +26,48 @@ class KNModel:
     ctx_c1: List[Optional[torch.Tensor]]
     ctx_c2: List[Optional[torch.Tensor]]
     ctx_uf: List[Optional[torch.Tensor]]
-    # Discounts
     D1: float
     D2: float
     D3: float
-    # Continuation counts (unigram base case)
-    cont_count: torch.Tensor  # [V]
+    cont_count: torch.Tensor
     total_unique_bigrams: int
+
+
+def _collect_order(
+    encoded: List[np.ndarray],
+    order: int,
+    primes_ng: torch.Tensor,
+    primes_ctx: torch.Tensor,
+    device: torch.device,
+) -> Tuple[Dict[int, int], Dict[int, int]]:
+    """Collect n-gram and context counts for one order. Returns (ng_dict, ng_to_ctx_dict)."""
+    ng: Dict[int, int] = {}
+    ng_ctx: Dict[int, int] = {}  # ngram_hash → context_hash (for grouping)
+
+    for arr in encoded:
+        if arr.size < order + 1:
+            continue
+        t = torch.from_numpy(arr.astype(np.int64)).to(device)
+        n = t.numel()
+        L = n - order
+
+        ng_h = torch.zeros(L, dtype=torch.int64, device=device)
+        for k in range(order + 1):
+            ng_h = ng_h + t[k:L + k] * primes_ng[k]
+
+        ctx_h = torch.zeros(L, dtype=torch.int64, device=device)
+        for k in range(order):
+            ctx_h = ctx_h + t[k:L + k] * primes_ctx[k]
+
+        ng_cpu = ng_h.cpu().numpy()
+        ctx_cpu = ctx_h.cpu().numpy()
+        for i in range(L):
+            nh = int(ng_cpu[i])
+            ch = int(ctx_cpu[i])
+            ng[nh] = ng.get(nh, 0) + 1
+            ng_ctx[nh] = ch
+
+    return ng, ng_ctx
 
 
 def build_kn(
@@ -46,211 +76,148 @@ def build_kn(
     cfg,
     device: torch.device,
 ) -> KNModel:
-    """Build KN tables from encoded corpus. Chunked for memory safety."""
     max_order = int(cfg.kn_max_order)
-    chunk_sz = int(cfg.kn_chunk_size)
+    primes_ng = torch.tensor(_PRIMES[:max_order + 1], dtype=torch.int64, device=device)
+    primes_ctx = torch.tensor(_PRIMES[:max_order], dtype=torch.int64, device=device)
 
-    primes_list = _PRIMES[:max_order + 1]
-    primes_ng = torch.tensor(primes_list, dtype=torch.int64, device=device)
-    primes_ctx = torch.tensor(primes_list[:max_order], dtype=torch.int64, device=device)
+    ng_keys_l: List[Optional[torch.Tensor]] = [None] * (max_order + 1)
+    ng_counts_l: List[Optional[torch.Tensor]] = [None] * (max_order + 1)
+    ctx_keys_l: List[Optional[torch.Tensor]] = [None] * (max_order + 1)
+    ctx_totals_l: List[Optional[torch.Tensor]] = [None] * (max_order + 1)
+    ctx_c1_l: List[Optional[torch.Tensor]] = [None] * (max_order + 1)
+    ctx_c2_l: List[Optional[torch.Tensor]] = [None] * (max_order + 1)
+    ctx_uf_l: List[Optional[torch.Tensor]] = [None] * (max_order + 1)
 
-    # Accumulators: dict[order] -> dict[hash] -> count
-    ng_acc = [{} for _ in range(max_order + 1)]
-    ctx_acc = [{} for _ in range(max_order + 1)]
-
-    # Process in chunks
-    for chunk_start in range(0, len(encoded), chunk_sz):
-        chunk = encoded[chunk_start:chunk_start + chunk_sz]
-        for arr in chunk:
-            if arr.size < 2:
-                continue
-            t = torch.from_numpy(arr.astype(np.int64)).to(device)
-            n = t.numel()
-            for order in range(1, max_order + 1):
-                if n < order + 1:
-                    continue
-                L = n - order
-                # Hash n-grams: context + next word
-                ng_h = torch.zeros(L, dtype=torch.int64, device=device)
-                for k in range(order + 1):
-                    ng_h = ng_h + t[k:L + k] * primes_ng[k]
-                # Hash contexts: just the order-length prefix
-                ctx_h = torch.zeros(L, dtype=torch.int64, device=device)
-                for k in range(order):
-                    ctx_h = ctx_h + t[k:L + k] * primes_ctx[k]
-                # Accumulate on CPU
-                ng_h_cpu = ng_h.cpu().numpy()
-                ctx_h_cpu = ctx_h.cpu().numpy()
-                ng_d = ng_acc[order]
-                ctx_d = ctx_acc[order]
-                for i in range(len(ng_h_cpu)):
-                    nh = int(ng_h_cpu[i])
-                    ch = int(ctx_h_cpu[i])
-                    ng_d[nh] = ng_d.get(nh, 0) + 1
-                    ctx_d[ch] = ctx_d.get(ch, 0) + 1
-
-    # Build sorted GPU tensors per order
-    ng_keys_list = [None] * (max_order + 1)
-    ng_counts_list = [None] * (max_order + 1)
-    ctx_keys_list = [None] * (max_order + 1)
-    ctx_totals_list = [None] * (max_order + 1)
-    ctx_c1_list = [None] * (max_order + 1)
-    ctx_c2_list = [None] * (max_order + 1)
-    ctx_uf_list = [None] * (max_order + 1)
-
-    n1_total = n2_total = n3_total = 0
+    n1_all = n2_all = n3_all = 0
 
     for order in range(1, max_order + 1):
-        if not ng_acc[order]:
+        ng_dict, ng_ctx = _collect_order(encoded, order, primes_ng, primes_ctx, device)
+        if not ng_dict:
             continue
-        # N-gram table
-        keys = np.fromiter(ng_acc[order].keys(), dtype=np.int64,
-                           count=len(ng_acc[order]))
-        counts = np.fromiter(ng_acc[order].values(), dtype=np.int64,
-                             count=len(ng_acc[order]))
-        sort_idx = np.argsort(keys)
-        ng_keys_list[order] = torch.from_numpy(keys[sort_idx]).to(device)
-        ng_counts_list[order] = torch.from_numpy(counts[sort_idx]).to(device)
 
-        n1_total += int((counts == 1).sum())
-        n2_total += int((counts == 2).sum())
-        n3_total += int((counts >= 3).sum())
+        # Build sorted ngram table
+        keys = np.fromiter(ng_dict.keys(), dtype=np.int64, count=len(ng_dict))
+        counts = np.fromiter(ng_dict.values(), dtype=np.int64, count=len(ng_dict))
+        sidx = np.argsort(keys)
+        ng_keys_l[order] = torch.from_numpy(keys[sidx]).to(device)
+        ng_counts_l[order] = torch.from_numpy(counts[sidx]).to(device)
 
-        # Context aggregates: per unique context hash, compute total/c1/c2/uf
-        # Group n-grams by their context
-        ctx_groups = {}
-        for nh, c in ng_acc[order].items():
-            # We need to recover the context hash from the n-gram hash
-            # But we don't store it directly. Instead, build from ctx_acc.
-            pass
+        n1_all += int((counts == 1).sum())
+        n2_all += int((counts == 2).sum())
+        n3_all += int((counts >= 3).sum())
 
-        # Simpler approach: rebuild context stats from ctx_acc + n-gram data
-        # For each context, count unique followers, singletons, etc.
-        # Use the ctx_acc which counts total tokens per context
-        c_keys = np.fromiter(ctx_acc[order].keys(), dtype=np.int64,
-                             count=len(ctx_acc[order]))
-        c_totals = np.fromiter(ctx_acc[order].values(), dtype=np.int64,
-                               count=len(ctx_acc[order]))
-        c_sort = np.argsort(c_keys)
-        ctx_keys_list[order] = torch.from_numpy(c_keys[c_sort]).to(device)
-        ctx_totals_list[order] = torch.from_numpy(c_totals[c_sort]).to(device)
+        # Group ngrams by context → compute per-context aggregates
+        ctx_groups: Dict[int, List[int]] = {}
+        for nh, c in ng_dict.items():
+            ch = ng_ctx.get(nh)
+            if ch is None:
+                continue
+            ctx_groups.setdefault(ch, []).append(c)
 
-        # For c1/c2/uf we need per-context n-gram count distribution
-        # Build from n-gram counts grouped by context hash
-        # This requires knowing which n-grams belong to which context
-        # We'll recompute from the raw data
-        uf = np.ones(len(c_keys), dtype=np.int64)  # placeholder
-        c1 = np.zeros(len(c_keys), dtype=np.int64)
-        c2 = np.zeros(len(c_keys), dtype=np.int64)
-        ctx_uf_list[order] = torch.from_numpy(uf[c_sort]).to(device)
-        ctx_c1_list[order] = torch.from_numpy(c1[c_sort]).to(device)
-        ctx_c2_list[order] = torch.from_numpy(c2[c_sort]).to(device)
+        n_ctx = len(ctx_groups)
+        c_keys = np.empty(n_ctx, dtype=np.int64)
+        c_totals = np.empty(n_ctx, dtype=np.int64)
+        c_c1 = np.empty(n_ctx, dtype=np.int64)
+        c_c2 = np.empty(n_ctx, dtype=np.int64)
+        c_uf = np.empty(n_ctx, dtype=np.int64)
 
-    # Compute discounts
-    if n1_total > 0 and n2_total > 0:
-        Y = n1_total / (n1_total + 2.0 * n2_total)
-        D1 = max(0.1, min(0.95, 1.0 - 2.0 * Y * n2_total / max(n1_total, 1)))
-        D2 = max(0.1, min(0.95, 2.0 - 3.0 * Y * (n3_total / max(n2_total, 1))))
-        D3 = max(0.1, min(0.95, 3.0 - 4.0 * Y * ((n3_total + 1) / max(n3_total, 1))))
+        for i, (ch, count_list) in enumerate(ctx_groups.items()):
+            c_keys[i] = ch
+            c_totals[i] = sum(count_list)
+            c_c1[i] = sum(1 for c in count_list if c == 1)
+            c_c2[i] = sum(1 for c in count_list if c == 2)
+            c_uf[i] = len(count_list)
+
+        csort = np.argsort(c_keys)
+        ctx_keys_l[order] = torch.from_numpy(c_keys[csort]).to(device)
+        ctx_totals_l[order] = torch.from_numpy(c_totals[csort]).to(torch.float32).to(device)
+        ctx_c1_l[order] = torch.from_numpy(c_c1[csort]).to(torch.float32).to(device)
+        ctx_c2_l[order] = torch.from_numpy(c_c2[csort]).to(torch.float32).to(device)
+        ctx_uf_l[order] = torch.from_numpy(c_uf[csort]).to(torch.float32).to(device)
+
+    # Discounts
+    if n1_all > 0 and n2_all > 0:
+        Y = n1_all / (n1_all + 2.0 * n2_all)
+        D1 = max(0.1, min(0.95, 1.0 - 2.0 * Y * n2_all / max(n1_all, 1)))
+        D2 = max(0.1, min(0.95, 2.0 - 3.0 * Y * (n3_all / max(n2_all, 1))))
+        D3 = max(0.1, min(0.95, 3.0 - 4.0 * Y * ((n3_all + 1) / max(n3_all, 1))))
     else:
         D1, D2, D3 = 0.5, 0.75, 0.9
 
-    # Continuation counts for unigram base case
-    # cont_count[w] = number of unique bigrams (*, w) — how many predecessors w has
+    # Continuation counts
     cont_count = torch.ones(V, dtype=torch.float32, device=device)
-    if ng_keys_list[1] is not None:
-        # Count unique first-word for each second-word in bigrams
-        # This requires iterating bigram data
-        for arr in encoded:
-            if arr.size < 2:
-                continue
-            t = torch.from_numpy(arr.astype(np.int64)).to(device)
-            # unique bigram (a, b): count distinct a's for each b
-            pairs = t[:-1] * V + t[1:]
-            uniq_pairs = torch.unique(pairs)
-            b_ids = (uniq_pairs % V).to(torch.int64)
-            cont_count.scatter_add_(0, b_ids,
-                                    torch.ones_like(b_ids, dtype=torch.float32))
+    for arr in encoded:
+        if arr.size < 2:
+            continue
+        t = torch.from_numpy(arr.astype(np.int64)).to(device)
+        pairs = t[:-1] * V + t[1:]
+        uniq = torch.unique(pairs)
+        b_ids = (uniq % V).to(torch.int64)
+        cont_count.scatter_add_(0, b_ids, torch.ones_like(b_ids, dtype=torch.float32))
     total_ub = int(cont_count.sum().item())
 
     print(f"  KN-{max_order}gram: D1={D1:.3f} D2={D2:.3f} D3={D3:.3f}  "
-          f"n1={n1_total:,} n2={n2_total:,} n3+={n3_total:,}")
+          f"n1={n1_all:,} n2={n2_all:,} n3+={n3_all:,}")
 
     return KNModel(
-        max_order=max_order,
-        vocab_size=V,
-        device=device,
-        ng_keys=ng_keys_list,
-        ng_counts=ng_counts_list,
-        ctx_keys=ctx_keys_list,
-        ctx_totals=ctx_totals_list,
-        ctx_c1=ctx_c1_list,
-        ctx_c2=ctx_c2_list,
-        ctx_uf=ctx_uf_list,
+        max_order=max_order, vocab_size=V, device=device,
+        ng_keys=ng_keys_l, ng_counts=ng_counts_l,
+        ctx_keys=ctx_keys_l, ctx_totals=ctx_totals_l,
+        ctx_c1=ctx_c1_l, ctx_c2=ctx_c2_l, ctx_uf=ctx_uf_l,
         D1=D1, D2=D2, D3=D3,
-        cont_count=cont_count,
-        total_unique_bigrams=total_ub,
+        cont_count=cont_count, total_unique_bigrams=total_ub,
     )
 
 
-def _lookup(sorted_keys: torch.Tensor, sorted_vals: torch.Tensor,
-            query: torch.Tensor) -> torch.Tensor:
-    """Binary search lookup. Returns 0 for missing keys."""
-    pos = torch.searchsorted(sorted_keys, query)
-    safe = pos.clamp(max=sorted_keys.numel() - 1)
-    hit = (pos < sorted_keys.numel()) & (sorted_keys[safe] == query)
-    return torch.where(hit, sorted_vals[safe].to(torch.float32),
-                       torch.zeros_like(query, dtype=torch.float32))
+def _lookup(sk: torch.Tensor, sv: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
+    if sk.numel() == 0:
+        return torch.zeros_like(q, dtype=torch.float32)
+    pos = torch.searchsorted(sk, q)
+    safe = pos.clamp(max=sk.numel() - 1)
+    hit = (pos < sk.numel()) & (sk[safe] == q)
+    return torch.where(hit, sv[safe].to(torch.float32), torch.zeros_like(q, dtype=torch.float32))
 
 
 def score_batch(
     kn: KNModel,
-    context: torch.Tensor,  # [B, max_order] padded context token ids
-    target: torch.Tensor,   # [B] next token ids
+    context: torch.Tensor,  # [B, max_order]
+    target: torch.Tensor,   # [B]
 ) -> torch.Tensor:
-    """Score P(target | context) using recursive MKN backoff.
-
-    Returns [B] log-probabilities.
-    """
+    """Score P(target | context) with proper MKN backoff. Returns [B] log-probs."""
     B = target.shape[0]
     device = kn.device
-    V = kn.vocab_size
-
     primes = torch.tensor(_PRIMES[:kn.max_order + 1], dtype=torch.int64, device=device)
 
-    # Base case: continuation probability (unigram)
+    # Base: continuation probability
     p = kn.cont_count[target] / max(kn.total_unique_bigrams, 1)
     p = p.clamp(min=1e-10)
 
-    # Recursive backoff from order 1 to max_order
     for order in range(1, kn.max_order + 1):
         if kn.ng_keys[order] is None or kn.ctx_keys[order] is None:
             continue
-
-        # Build context hash for this order
-        # context[:, -order:] are the last `order` tokens
         ctx_end = context.shape[1]
         ctx_start = max(0, ctx_end - order)
         if ctx_end - ctx_start < order:
             continue
 
-        ctx_slice = context[:, ctx_start:ctx_end]  # [B, order]
-        # N-gram hash: context + target
+        ctx_slice = context[:, ctx_start:ctx_end]
+
         ng_h = torch.zeros(B, dtype=torch.int64, device=device)
         for k in range(order):
             ng_h = ng_h + ctx_slice[:, k] * primes[k]
         ng_h = ng_h + target * primes[order]
 
-        # Context hash
         ctx_h = torch.zeros(B, dtype=torch.int64, device=device)
         for k in range(order):
             ctx_h = ctx_h + ctx_slice[:, k] * primes[k]
 
-        # Lookup counts
         c = _lookup(kn.ng_keys[order], kn.ng_counts[order], ng_h)
         ctx_total = _lookup(kn.ctx_keys[order], kn.ctx_totals[order], ctx_h)
+        c1 = _lookup(kn.ctx_keys[order], kn.ctx_c1[order], ctx_h)
+        c2 = _lookup(kn.ctx_keys[order], kn.ctx_c2[order], ctx_h)
+        uf = _lookup(kn.ctx_keys[order], kn.ctx_uf[order], ctx_h)
 
-        # Discount selection
+        # Discount selection per n-gram count
         D = torch.where(c >= 3, torch.full_like(c, kn.D3),
             torch.where(c >= 2, torch.full_like(c, kn.D2),
             torch.where(c >= 1, torch.full_like(c, kn.D1),
@@ -259,35 +226,24 @@ def score_batch(
         safe_total = ctx_total.clamp(min=1.0)
         disc = (c - D).clamp(min=0.0) / safe_total
 
-        # Backoff weight (simplified: use D1 * unique_followers estimate)
-        # Full version would use ctx_c1/c2/uf per context
-        lam = D.mean() * 1.0  # simplified lambda
-        # Better: if we have ctx aggregates
-        has_ctx = ctx_total > 0
-        lam_full = D * c.clamp(max=1) / safe_total  # rough estimate
-        lam_val = torch.where(has_ctx, 0.4 * torch.ones_like(c), torch.ones_like(c))
+        # Proper backoff weight: λ = (D1·c1 + D2·c2 + D3·(uf-c1-c2)) / total
+        n3p = (uf - c1 - c2).clamp(min=0.0)
+        lam = (kn.D1 * c1 + kn.D2 * c2 + kn.D3 * n3p) / safe_total
 
-        # Interpolated probability
-        p = torch.where(has_ctx, disc + lam_val * p, p)
+        has_ctx = ctx_total > 0
+        p = torch.where(has_ctx, disc + lam * p, p)
 
     return torch.log(p.clamp(min=1e-10))
 
 
-def score_next_token(
-    kn: KNModel,
-    context_ids: List[int],
-    V: int,
-) -> torch.Tensor:
-    """Score ALL possible next tokens given a single context. Returns [V] probs."""
+def score_next_token(kn: KNModel, context_ids: List[int], V: int) -> torch.Tensor:
+    """Score all V next tokens for a single context. Returns [V] probs."""
     device = kn.device
     max_ctx = min(len(context_ids), kn.max_order)
     ctx = context_ids[-max_ctx:] if max_ctx > 0 else []
-
-    # Pad context to max_order
     padded = [0] * (kn.max_order - len(ctx)) + ctx
     ctx_t = torch.tensor([padded], dtype=torch.int64, device=device).expand(V, -1)
     targets = torch.arange(V, dtype=torch.int64, device=device)
-
     log_p = score_batch(kn, ctx_t, targets)
     p = torch.exp(log_p)
     return p / p.sum().clamp(min=1e-9)
