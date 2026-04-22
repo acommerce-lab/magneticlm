@@ -122,10 +122,15 @@ def build_concept_cache(
     device: torch.device,
     min_ppmi: float = 0.5,
 ) -> ConceptCache:
-    """Build the concept cache from co-occurrence statistics.
+    """Build concept cache from DISTRIBUTIONAL SIMILARITY, not raw PPMI.
 
-    Computes PPMI for all pairs, then for each word keeps top-K neighbors
-    with highest PPMI as its "concept neighborhood."
+    Two words are substitutes if they appear in the SAME contexts —
+    measured by overlap count of their PPMI context sets.
+
+    Algorithm (GPU-native, blocked):
+      1. Build binary PPMI matrix B[V, V] (sparse)
+      2. Process in row-blocks: B[block] @ B.T → [block_size, V]
+      3. For each row, top-K by overlap = distributional substitutes
     """
     # Compute PPMI
     total = ctx_counts.sum().clamp(min=1.0)
@@ -136,55 +141,78 @@ def build_concept_cache(
     pmi = torch.log((p_ab + 1e-12) / (p_a * p_b + 1e-12))
     ppmi = pmi.clamp(min=0.0)
 
-    # Filter low PPMI
     keep = ppmi >= min_ppmi
     rows_f = ctx_rows[keep]
     cols_f = ctx_cols[keep]
     ppmi_f = ppmi[keep]
 
-    # For each word (row), collect top-K neighbors by PPMI
-    # Use scatter to build per-word neighbor lists
+    if rows_f.numel() == 0:
+        print(f"  [concept_cache] no edges, empty cache")
+        nbr_ids = torch.zeros(V, K, dtype=torch.int64, device=device)
+        nbr_weights = torch.zeros(V, K, dtype=torch.float32, device=device)
+        return ConceptCache(nbr_ids, nbr_weights, K, V)
+
+    # Build sparse binary PPMI matrix B[V, V] (1 where PPMI > threshold)
+    indices = torch.stack([rows_f, cols_f], dim=0)
+    ones = torch.ones(rows_f.numel(), dtype=torch.float32, device=device)
+    B = torch.sparse_coo_tensor(indices, ones, (V, V)).coalesce()
+
+    # Compute distributional similarity in blocks: overlap = B @ B.T
     nbr_ids = torch.zeros(V, K, dtype=torch.int64, device=device)
     nbr_weights = torch.zeros(V, K, dtype=torch.float32, device=device)
 
-    if rows_f.numel() == 0:
-        print(f"  [concept_cache] no PPMI edges above {min_ppmi}, empty cache")
-        return ConceptCache(nbr_ids, nbr_weights, K, V)
+    block_size = min(1000, V)
+    n_found = 0
 
-    # Sort by (row, -ppmi) to pick top-K per row
-    sort_key = rows_f.to(torch.int64) * 1000000 + (1000000 - (ppmi_f * 1000).to(torch.int64))
-    order = torch.argsort(sort_key)
-    rows_s = rows_f[order]
-    cols_s = cols_f[order]
-    ppmi_s = ppmi_f[order]
+    for start in range(0, V, block_size):
+        end = min(start + block_size, V)
+        bs = end - start
+        # Extract block rows as dense [bs, V]
+        block_dense = torch.zeros(bs, V, dtype=torch.float32, device=device)
+        # Fill from sparse
+        b_idx = B.indices()
+        b_val = B.values()
+        mask = (b_idx[0] >= start) & (b_idx[0] < end)
+        if mask.any():
+            local_rows = b_idx[0][mask] - start
+            local_cols = b_idx[1][mask]
+            block_dense[local_rows, local_cols] = b_val[mask]
 
-    # Position within each row
-    boundaries = torch.ones_like(rows_s, dtype=torch.bool)
-    boundaries[1:] = rows_s[1:] != rows_s[:-1]
-    group_id = torch.cumsum(boundaries.to(torch.int64), dim=0) - 1
-    global_idx = torch.arange(rows_s.numel(), device=device, dtype=torch.int64)
-    group_first = torch.full_like(group_id, fill_value=rows_s.numel())
-    group_first.scatter_reduce_(0, group_id, global_idx, reduce="amin", include_self=False)
-    pos_in_group = global_idx - group_first[group_id]
+        if block_dense.sum() == 0:
+            continue
 
-    # Keep only first K per group
-    keep_k = pos_in_group < K
-    r_k = rows_s[keep_k]
-    c_k = cols_s[keep_k]
-    p_k = ppmi_s[keep_k]
-    pos_k = pos_in_group[keep_k]
+        # Overlap: block_dense @ B.T → [bs, V]
+        # B.T @ block_dense.T → [V, bs], then transpose
+        sim = torch.sparse.mm(B.t(), block_dense.t()).t()  # [bs, V]
 
-    # Fill the tables
-    nbr_ids[r_k, pos_k] = c_k
-    nbr_weights[r_k, pos_k] = p_k
+        # Zero out self-similarity
+        for i in range(bs):
+            w = start + i
+            if w < V:
+                sim[i, w] = 0.0
+
+        # Top-K per row
+        topk_vals, topk_idx = torch.topk(sim, min(K, V), dim=1)
+
+        for i in range(bs):
+            w = start + i
+            if w >= V:
+                break
+            valid = topk_vals[i] > 0
+            n_valid = int(valid.sum().item())
+            if n_valid == 0:
+                continue
+            n_take = min(n_valid, K)
+            nbr_ids[w, :n_take] = topk_idx[i, :n_take]
+            nbr_weights[w, :n_take] = topk_vals[i, :n_take]
+            n_found += 1
 
     # Normalize weights per word
     w_sum = nbr_weights.sum(dim=1, keepdim=True).clamp(min=1e-9)
     nbr_weights = nbr_weights / w_sum
 
-    n_with = int((nbr_weights.sum(dim=1) > 0).sum().item())
-    print(f"  [concept_cache] K={K}  words_with_neighbors={n_with}/{V}  "
-          f"edges_kept={int(keep_k.sum().item()):,}")
+    print(f"  [concept_cache] distributional similarity K={K}  "
+          f"words_with_subs={n_found}/{V}")
 
     return ConceptCache(nbr_ids, nbr_weights, K, V)
 
