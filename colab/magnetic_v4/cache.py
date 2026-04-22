@@ -90,8 +90,114 @@ class DecayCache:
 
 
 # ======================================================================
-# Conceptual cache: PPMI trigger lookup (= glow centers as a table)
+# Directional distributional similarity tables
 # ======================================================================
+
+@dataclass
+class DirectionalSubs:
+    """Two substitution tables: successor-subs and predecessor-subs.
+
+    successor_subs[w]: words that share FOLLOWERS with w
+      → useful for finding adoption candidates (their children = creative options)
+
+    predecessor_subs[w]: words that share PREDECESSORS with w
+      → useful for validating if a candidate fits after the current word
+    """
+    succ_ids: torch.Tensor      # [V, K] successor-substitute word ids
+    succ_weights: torch.Tensor  # [V, K] overlap scores (normalized)
+    pred_ids: torch.Tensor      # [V, K] predecessor-substitute word ids
+    pred_weights: torch.Tensor  # [V, K] overlap scores (normalized)
+    K: int
+    V: int
+
+
+def _build_binary_overlap(
+    rows: torch.Tensor,
+    cols: torch.Tensor,
+    V: int,
+    K: int,
+    device: torch.device,
+    block_size: int = 1000,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Compute overlap = B @ B.T for binary matrix B, return top-K per row."""
+    indices = torch.stack([rows, cols], dim=0)
+    ones = torch.ones(rows.numel(), dtype=torch.float32, device=device)
+    B = torch.sparse_coo_tensor(indices, ones, (V, V)).coalesce()
+
+    top_ids = torch.zeros(V, K, dtype=torch.int64, device=device)
+    top_wts = torch.zeros(V, K, dtype=torch.float32, device=device)
+    n_found = 0
+
+    for start in range(0, V, block_size):
+        end = min(start + block_size, V)
+        bs = end - start
+        block = torch.zeros(bs, V, dtype=torch.float32, device=device)
+        b_idx = B.indices()
+        b_val = B.values()
+        mask = (b_idx[0] >= start) & (b_idx[0] < end)
+        if mask.any():
+            block[b_idx[0][mask] - start, b_idx[1][mask]] = b_val[mask]
+
+        if block.sum() == 0:
+            continue
+
+        sim = torch.sparse.mm(B.t(), block.t()).t()
+        for i in range(bs):
+            w = start + i
+            if w < V:
+                sim[i, w] = 0.0
+
+        vals, idx = torch.topk(sim, min(K, V), dim=1)
+        for i in range(bs):
+            w = start + i
+            if w >= V:
+                break
+            n_valid = int((vals[i] > 0).sum().item())
+            n_take = min(n_valid, K)
+            if n_take > 0:
+                top_ids[w, :n_take] = idx[i, :n_take]
+                top_wts[w, :n_take] = vals[i, :n_take]
+                n_found += 1
+
+    w_sum = top_wts.sum(dim=1, keepdim=True).clamp(min=1e-9)
+    top_wts = top_wts / w_sum
+    return top_ids, top_wts, n_found
+
+
+def build_directional_subs(
+    bg_rows: torch.Tensor,
+    bg_cols: torch.Tensor,
+    V: int,
+    K: int,
+    device: torch.device,
+) -> DirectionalSubs:
+    """Build two substitution tables from directional bigram pairs.
+
+    Bigram (a → b): a is predecessor, b is successor.
+
+    Successor-subs: words that share followers.
+      Matrix M_succ[a, b] = 1 if b follows a. Overlap = M_succ @ M_succ.T.
+      sim_succ(a1, a2) = how many shared followers.
+
+    Predecessor-subs: words that share predecessors.
+      Matrix M_pred[b, a] = 1 if a precedes b. Overlap = M_pred @ M_pred.T.
+      sim_pred(b1, b2) = how many shared predecessors.
+    """
+    print(f"    building successor-subs (shared followers)...")
+    succ_ids, succ_wts, n_succ = _build_binary_overlap(
+        bg_rows, bg_cols, V, K, device
+    )
+    print(f"    building predecessor-subs (shared predecessors)...")
+    pred_ids, pred_wts, n_pred = _build_binary_overlap(
+        bg_cols, bg_rows, V, K, device
+    )
+    print(f"  [dir_subs] succ={n_succ}/{V}  pred={n_pred}/{V}")
+
+    return DirectionalSubs(
+        succ_ids=succ_ids, succ_weights=succ_wts,
+        pred_ids=pred_ids, pred_weights=pred_wts,
+        K=K, V=V,
+    )
 
 @dataclass
 class ConceptCache:

@@ -19,7 +19,7 @@ from .scorer import score as score_fn
 from .tokenizer import Vocab
 from .wave import propagate, propagate_batch
 from .kn import KNModel, score_next_token as kn_score_next
-from .cache import DecayCache, ConceptCache, concept_boost
+from .cache import DecayCache, ConceptCache, DirectionalSubs, concept_boost
 
 
 OOD_CLOZE = [
@@ -367,6 +367,7 @@ def evaluate_kn_diagnostics(
     cfg,
     device: torch.device,
     max_tokens: int = 50000,
+    dir_subs: Optional["DirectionalSubs"] = None,
 ) -> Dict:
     """Test KN layer: without cache, with stat cache, with concept cache."""
     arrs = [a for a in encoded if a.size > 1]
@@ -468,6 +469,51 @@ def evaluate_kn_diagnostics(
         results["kn_both_caches"] = {"ppl": full_ppl, "hit@1": hits1/max(n,1), "hit@5": hits5/max(n,1)}
         print(f"    [KN + both caches]  PPL={full_ppl:.2f}  hit@1={hits1/max(n,1):.4f}  hit@5={hits5/max(n,1):.4f}")
 
+    # --- KN + directional adoption (successor-subs expand candidates) ---
+    if dir_subs is not None:
+        nll, n, hits1, hits5 = 0.0, 0, 0, 0
+        cache3 = DecayCache(window=cfg.stat_cache_window)
+        adopt_boost = 0.3
+        for i in range(n_eval):
+            ctx_start = max(0, i - kn_model.max_order)
+            ctx = flat[ctx_start:i + 1].tolist()
+            tgt = int(flat[i + 1])
+            current = int(flat[i])
+
+            kn_dist = kn_score_next(kn_model, ctx, V)
+            s_boost = cache3.get_boost(V, device)
+
+            # Adoption: successor-subs of current word → their KN children
+            adoption = torch.zeros(V, dtype=torch.float32, device=device)
+            sub_ids = dir_subs.succ_ids[current]  # [K]
+            sub_wts = dir_subs.succ_weights[current]  # [K]
+            for j in range(dir_subs.K):
+                sw = float(sub_wts[j].item())
+                if sw < 1e-6:
+                    break
+                sub_w = int(sub_ids[j].item())
+                sub_dist = kn_score_next(kn_model, ctx[:-1] + [sub_w], V)
+                # Check predecessor compatibility
+                pred_sim = float(dir_subs.pred_weights[tgt].sum().item()) if tgt < V else 0
+                adoption = adoption + sw * sub_dist
+
+            if adoption.sum() > 1e-9:
+                adoption = adoption / adoption.sum().clamp(min=1e-9)
+
+            dist = (1 - lam - adopt_boost) * kn_dist + lam * s_boost + adopt_boost * adoption
+            dist = dist / dist.sum().clamp(min=1e-9)
+            p = float(dist[tgt].item())
+            nll += -math.log(max(p, 1e-12))
+            _, top = torch.topk(dist, 50)
+            top_list = top.tolist()
+            if tgt in top_list[:1]: hits1 += 1
+            if tgt in top_list[:5]: hits5 += 1
+            n += 1
+            cache3.observe(int(flat[i]))
+        adopt_ppl = math.exp(nll / max(n, 1))
+        results["kn_adoption"] = {"ppl": adopt_ppl, "hit@1": hits1/max(n,1), "hit@5": hits5/max(n,1)}
+        print(f"    [KN + cache + adopt] PPL={adopt_ppl:.2f}  hit@1={hits1/max(n,1):.4f}  hit@5={hits5/max(n,1):.4f}")
+
     return results
 
 
@@ -532,6 +578,7 @@ def run_full_eval(
     device: torch.device,
     kn_model=None,
     ccache=None,
+    dir_subs=None,
 ) -> Dict:
     results: Dict = {}
 
@@ -540,6 +587,7 @@ def run_full_eval(
         print("  [eval] KN-5gram diagnostics (before/after caches)...")
         results["kn_diagnostics"] = evaluate_kn_diagnostics(
             kn_model, ccache, encoded_valid, vocab, cfg, device,
+            dir_subs=dir_subs,
         )
 
     # --- Layer diagnostics: syntax-only and semantic-only ---
