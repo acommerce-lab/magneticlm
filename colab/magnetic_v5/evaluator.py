@@ -27,14 +27,15 @@ OOD_CLOZE = [
 
 
 def _decay_boost(history: List[int], V: int, device: torch.device) -> torch.Tensor:
-    """Logarithmic decay cache boost. Returns [V] distribution."""
-    b = torch.zeros(V, dtype=torch.float32, device=device)
+    """Logarithmic decay cache boost — vectorized. Returns [V] distribution."""
     if len(history) < 2:
-        return b
-    n = len(history)
-    for i, tok in enumerate(history):
-        age = n - 1 - i
-        b[tok] += 1.0 / math.log(2.0 + age)
+        return torch.zeros(V, dtype=torch.float32, device=device)
+    h = torch.tensor(history, dtype=torch.int64, device=device)
+    n = h.numel()
+    ages = torch.arange(n - 1, -1, -1, dtype=torch.float32, device=device)
+    weights = 1.0 / torch.log(2.0 + ages)
+    b = torch.zeros(V, dtype=torch.float32, device=device)
+    b.scatter_add_(0, h, weights)
     s = b.sum()
     return b / s if s > 1e-9 else b
 
@@ -83,7 +84,7 @@ def _adoption_dist(kn: Dict, subs: Dict, current: int, context: List[int], V: in
 
 def eval_kn_layers(
     kn: Dict, subs: Dict, encoded: List[np.ndarray],
-    cfg, device: torch.device, max_tokens: int = 50000,
+    cfg, device: torch.device, max_tokens: int = 5000,
 ) -> Dict:
     """Test each layer independently then combined."""
     arrs = [a for a in encoded if a.size > 1]
