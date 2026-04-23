@@ -146,6 +146,12 @@ def _batch_adoption(subs, contexts, V, device):
     return result
 
 
+def _adoption_dist(kn, subs, current, context, V, device):
+    """Single-case adoption for OOD eval (wraps batch function)."""
+    result = _batch_adoption(subs, [context], V, device)  # [1, V]
+    return result[0]
+
+
 def eval_kn_layers(
     kn: Dict, subs: Dict, encoded: List[np.ndarray],
     cfg, device: torch.device, max_tokens: int = 5000,
