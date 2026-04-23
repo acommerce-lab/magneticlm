@@ -173,37 +173,6 @@ def eval_kn_layers(
         return (1 - lam_s - lam_a) * kn_d + lam_s * cache + lam_a * adopt
     _eval("KN + cache + diffusion", _full)
 
-    # 0. Direct bigram matrix (sanity check — bypasses hash scoring)
-    bg = subs.get("bg_trans") if "bg_trans" in subs else kn.get("bg_trans")
-    if bg is not None:
-        def _bg_score(ctx, hist, cur):
-            selector = torch.zeros(V, dtype=torch.float32, device=device)
-            selector[cur] = 1.0
-            dist = torch.sparse.mm(bg.t(), selector.unsqueeze(1)).squeeze(1)
-            eps = 0.05
-            dist = (1 - eps) * dist + eps * (1.0 / V)
-            return dist / dist.sum().clamp(min=1e-9)
-        _run("bigram (sparse matrix)", _bg_score)
-
-    # 1. KN only
-    _run("KN-5gram", lambda ctx, hist, cur: kn_score(kn, ctx))
-
-    # 2. KN + decay cache
-    _run("KN + stat_cache", lambda ctx, hist, cur:
-         (1 - lam_s) * kn_score(kn, ctx) + lam_s * _decay_boost(hist, V, device))
-
-    # 3. KN + adoption
-    _run("KN + adoption", lambda ctx, hist, cur:
-         (1 - lam_a) * kn_score(kn, ctx) + lam_a * _adoption_dist(kn, subs, cur, ctx, V, device))
-
-    # 4. KN + cache + diffusion (weighted sum — adoption is now multi-hop)
-    def full_score(ctx, hist, cur):
-        base = kn_score(kn, ctx)
-        cache = _decay_boost(hist, V, device)
-        adopt = _adoption_dist(kn, subs, cur, ctx, V, device)
-        return (1 - lam_s - lam_a) * base + lam_s * cache + lam_a * adopt
-    _run("KN + cache + diffusion", full_score)
-
     return results
 
 
