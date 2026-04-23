@@ -39,17 +39,18 @@ def _decay_boost(history: List[int], V: int, device: torch.device) -> torch.Tens
     return b / s if s > 1e-9 else b
 
 
-def _adoption_dist(kn: Dict, subs: Dict, current: int, context: List[int], V: int, device: torch.device) -> torch.Tensor:
-    """Build adoption distribution via sparse bigram matrix — no Python loops.
+def _adoption_dist(kn: Dict, subs: Dict, current: int, context: List[int], V: int, device: torch.device, lam_step: float = 0.7) -> torch.Tensor:
+    """Adoption via substitutes' bigram children, weighted by sim × λ^d × glow.
 
-    Uses pre-built bg_trans[V,V]: one sparse matmul instead of K calls to score_all.
+    Score(w) = Σ_s [ sim(current, s) × P_bigram(s→w) × λ^1 × glow(w) ]
+    Uses sparse matmul: selector @ bg_trans.T — one GPU operation.
     """
-    bg = kn.get("bg_trans")
+    bg = subs.get("bg_trans")
     if bg is None:
         return torch.zeros(V, dtype=torch.float32, device=device)
 
-    sub_ids = subs["succ_ids"][current]  # [K]
-    sub_wts = subs["succ_wts"][current]  # [K]
+    sub_ids = subs["sub_ids"][current]  # [K]
+    sub_wts = subs["sub_wts"][current]  # [K]
 
     # Find active substitutes
     active = sub_wts > 1e-6
@@ -59,12 +60,20 @@ def _adoption_dist(kn: Dict, subs: Dict, current: int, context: List[int], V: in
     a_ids = sub_ids[active]   # [A]
     a_wts = sub_wts[active]   # [A]
 
-    # Selector vector: one-hot weighted by substitute weights
-    selector = torch.zeros(V, dtype=torch.float32, device=device)
-    selector.scatter_add_(0, a_ids.long(), a_wts)
+    # λ^d penalty: distance=1 hop through substitute
+    penalty = lam_step  # λ^1 for one-hop adoption
 
-    # adoption = selector @ bg_trans.T = weighted sum of substitute bigram rows
+    # Selector: weighted by sim × λ
+    selector = torch.zeros(V, dtype=torch.float32, device=device)
+    selector.scatter_add_(0, a_ids.long(), a_wts * penalty)
+
+    # adoption = selector @ bg_trans.T (substitute children)
     adoption = torch.sparse.mm(bg.t(), selector.unsqueeze(1)).squeeze(1)
+
+    # Apply glow: boost words in tight semantic clusters
+    glow = subs.get("glow")
+    if glow is not None:
+        adoption = adoption * (1.0 + glow)
 
     s = adoption.sum()
     if s > 1e-9:
@@ -116,7 +125,7 @@ def eval_kn_layers(
         print(f"    [{name:25s}] PPL={ppl:.2f}  hit@1={r['hit@1']:.4f}  hit@5={r['hit@5']:.4f}")
 
     # 0. Direct bigram matrix (sanity check — bypasses hash scoring)
-    bg = kn.get("bg_trans")
+    bg = subs.get("bg_trans") or kn.get("bg_trans")
     if bg is not None:
         def _bg_score(ctx, hist, cur):
             selector = torch.zeros(V, dtype=torch.float32, device=device)
@@ -230,23 +239,14 @@ def eval_subs_quality(subs: Dict, vocab, device: torch.device) -> Dict:
         for w in set(ctx_ids):
             if w == vocab.unk_id:
                 continue
-            # Check successor-subs
+            # Check substitutes
             for j in range(subs["K"]):
-                if subs["succ_ids"][w, j] == tgt:
+                if subs["sub_ids"][w, j] == tgt:
                     r = j + 1
                     if best_rank is None or r < best_rank:
                         best_rank = r
                         best_word = vocab.itos[w]
-                        best_type = "succ"
-                    break
-            # Check predecessor-subs
-            for j in range(subs["K"]):
-                if subs["pred_ids"][w, j] == tgt:
-                    r = j + 1
-                    if best_rank is None or r < best_rank:
-                        best_rank = r
-                        best_word = vocab.itos[w]
-                        best_type = "pred"
+                        best_type = "cosine"
                     break
 
         if best_rank is not None and best_rank <= 50:
