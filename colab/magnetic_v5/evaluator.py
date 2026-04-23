@@ -71,9 +71,22 @@ def _adoption_dist(kn: Dict, subs: Dict, current: int, context: List[int], V: in
     # adoption = selector @ bg_trans.T (substitute children)
     adoption = torch.sparse.mm(bg.t(), selector.unsqueeze(1)).squeeze(1)
 
-    # Apply glow: boost words in tight semantic clusters
+    # Context-aligned glow: boost words whose semantic neighborhood
+    # overlaps with the current context (not just globally important)
     glow = subs.get("glow")
-    if glow is not None:
+    ppmi = subs.get("ppmi_matrix")
+    if glow is not None and ppmi is not None and len(context) > 0:
+        # Build context vector from PPMI rows of context words
+        ctx_vec = torch.zeros(V, dtype=torch.float32, device=device)
+        for c in context[-5:]:
+            if 0 <= c < V:
+                ctx_vec[c] += 1.0
+        # Context-aligned glow = global glow × similarity to context
+        ctx_spread = torch.sparse.mm(ppmi.t(), ctx_vec.unsqueeze(1)).squeeze(1)
+        ctx_spread = ctx_spread / ctx_spread.sum().clamp(min=1e-9)
+        aligned_glow = glow * (1.0 + 5.0 * ctx_spread)
+        adoption = adoption * (1.0 + aligned_glow)
+    elif glow is not None:
         adoption = adoption * (1.0 + glow)
 
     s = adoption.sum()
@@ -148,12 +161,19 @@ def eval_kn_layers(
     _run("KN + adoption", lambda ctx, hist, cur:
          (1 - lam_a) * kn_score(kn, ctx) + lam_a * _adoption_dist(kn, subs, cur, ctx, V, device))
 
-    # 4. KN + cache + adoption
+    # 4. KN + cache + adoption (COMPETITION: max of two channels)
     def full_score(ctx, hist, cur):
-        base = kn_score(kn, ctx)
+        kn_dist = kn_score(kn, ctx)
         cache = _decay_boost(hist, V, device)
+        kn_cached = (1 - lam_s) * kn_dist + lam_s * cache
+
         adopt = _adoption_dist(kn, subs, cur, ctx, V, device)
-        return (1 - lam_s - lam_a) * base + lam_s * cache + lam_a * adopt
+
+        # Competition: for each candidate, take the HIGHER of KN vs adoption
+        # This lets adoption override KN when it's confident
+        # But KN still wins for grammatical next-tokens
+        combined = torch.max(kn_cached, lam_a * adopt * 10.0)
+        return combined / combined.sum().clamp(min=1e-9)
     _run("KN + cache + adoption", full_score)
 
     return results
