@@ -1,4 +1,4 @@
-"""KN-5gram — fully GPU-native: hash on GPU, sort, unique, scatter. No Python dicts."""
+"""KN-5gram — chunked GPU build to handle 1M+ lines without OOM."""
 
 from typing import Dict, List
 import numpy as np
@@ -8,59 +8,125 @@ _PRIMES = [1, 10007, 100003, 1000003, 10000019, 100000007,
            1000000007, 10000000019, 100000000003]
 
 
-def _collect_order(encoded, order, primes_ng, primes_ctx, device):
-    """Collect all n-gram/context hashes for one order on GPU. No Python dicts."""
-    all_ng, all_ctx = [], []
-    for arr in encoded:
-        if arr.size < order + 1:
-            continue
-        t = torch.from_numpy(arr.astype(np.int64)).to(device)
-        L = t.numel() - order
-        ng_h = sum(t[k:L + k] * primes_ng[k] for k in range(order + 1))
-        ctx_h = sum(t[k:L + k] * primes_ctx[k] for k in range(order))
-        all_ng.append(ng_h)
-        all_ctx.append(ctx_h)
-    if not all_ng:
+def _collect_order_chunked(encoded, order, primes_ng, primes_ctx, device, chunk_tokens=4_000_000):
+    """Chunked collection: concat sentences, compute hashes, reduce per chunk, merge."""
+    valid = [a for a in encoded if a.size >= order + 1]
+    if not valid:
         return None, None, None, None, None, None, None, 0, 0, 0
 
-    all_ng_t = torch.cat(all_ng)
-    all_ctx_t = torch.cat(all_ctx)
+    # Build chunks by token count
+    chunks = []
+    cur, cur_sz = [], 0
+    for a in valid:
+        cur.append(a)
+        cur_sz += a.size
+        if cur_sz >= chunk_tokens:
+            chunks.append(cur); cur = []; cur_sz = 0
+    if cur:
+        chunks.append(cur)
 
-    # Sort by ngram hash → unique with counts
-    sort_idx = torch.argsort(all_ng_t)
-    ng_sorted = all_ng_t[sort_idx]
-    ctx_sorted = all_ctx_t[sort_idx]
-    uniq_ng, ng_counts = torch.unique_consecutive(ng_sorted, return_counts=True)
+    reduced_ng_keys = []
+    reduced_ng_counts = []
+    reduced_ctx_per_ng = []
 
-    n1 = int((ng_counts == 1).sum().item())
-    n2 = int((ng_counts == 2).sum().item())
-    n3 = int((ng_counts == 3).sum().item())
+    for chunk in chunks:
+        flat = np.concatenate(chunk).astype(np.int64)
+        sent_ids = np.concatenate([
+            np.full(a.size, i, dtype=np.int32) for i, a in enumerate(chunk)
+        ])
+        t = torch.from_numpy(flat).to(device)
+        sid = torch.from_numpy(sent_ids).to(device)
+        n = t.numel()
+        L = n - order
 
-    # Context hash for each unique n-gram: first occurrence
+        # Check sentence boundaries: all order+1 tokens must be same sentence
+        same = torch.ones(L, dtype=torch.bool, device=device)
+        for d in range(1, order + 1):
+            same = same & (sid[:L] == sid[d:d + L])
+
+        # Compute hashes (vectorized — one op per order, not per sentence)
+        ng_h = sum(t[k:L + k] * primes_ng[k] for k in range(order + 1))
+        ctx_h = sum(t[k:L + k] * primes_ctx[k] for k in range(order))
+
+        # Filter cross-sentence n-grams
+        ng_h = ng_h[same]
+        ctx_h = ctx_h[same]
+
+        if ng_h.numel() == 0:
+            continue
+
+        # Sort and reduce this chunk
+        sort_idx = torch.argsort(ng_h)
+        ng_sorted = ng_h[sort_idx]
+        ctx_sorted = ctx_h[sort_idx]
+        uniq, counts = torch.unique_consecutive(ng_sorted, return_counts=True)
+        # First context per unique n-gram
+        first_idx = torch.zeros(uniq.numel(), dtype=torch.int64, device=device)
+        first_idx[1:] = torch.cumsum(counts[:-1], dim=0)
+        ctx_per = ctx_sorted[first_idx]
+
+        reduced_ng_keys.append(uniq.cpu())
+        reduced_ng_counts.append(counts.cpu())
+        reduced_ctx_per_ng.append(ctx_per.cpu())
+        del t, sid, ng_h, ctx_h, sort_idx, ng_sorted, ctx_sorted
+        torch.cuda.empty_cache() if device.type == 'cuda' else None
+
+    if not reduced_ng_keys:
+        return None, None, None, None, None, None, None, 0, 0, 0
+
+    # Merge across chunks
+    all_keys = torch.cat(reduced_ng_keys).to(device)
+    all_counts = torch.cat(reduced_ng_counts).to(device)
+    all_ctx = torch.cat(reduced_ctx_per_ng).to(device)
+
+    sort_idx = torch.argsort(all_keys)
+    all_keys = all_keys[sort_idx]
+    all_counts = all_counts[sort_idx]
+    all_ctx = all_ctx[sort_idx]
+
+    uniq_ng, inverse = torch.unique_consecutive(all_keys, return_inverse=True)
+    final_counts = torch.zeros(uniq_ng.numel(), dtype=torch.int64, device=device)
+    final_counts.scatter_add_(0, inverse, all_counts)
+
+    # First context per final unique n-gram
     first_idx = torch.zeros(uniq_ng.numel(), dtype=torch.int64, device=device)
-    first_idx[1:] = torch.cumsum(ng_counts[:-1], dim=0)
-    uniq_ctx_per_ng = ctx_sorted[first_idx]
+    first_idx[1:] = torch.cumsum(
+        torch.zeros_like(uniq_ng).scatter_add_(0, inverse, torch.ones_like(inverse))[:-1].cumsum(0)
+        # simpler: just take the first occurrence
+    , dim=0)
+    # Actually just use the first element per group
+    boundaries = torch.ones(all_keys.numel(), dtype=torch.bool, device=device)
+    boundaries[1:] = all_keys[1:] != all_keys[:-1]
+    first_positions = boundaries.nonzero(as_tuple=True)[0]
+    uniq_ctx_per_ng = all_ctx[first_positions]
 
-    # Per-context aggregates via scatter
+    n1 = int((final_counts == 1).sum().item())
+    n2 = int((final_counts == 2).sum().item())
+    n3 = int((final_counts == 3).sum().item())
+
+    # Per-context aggregates
     ctx_sort = torch.argsort(uniq_ctx_per_ng)
     ctx_s = uniq_ctx_per_ng[ctx_sort]
-    counts_s = ng_counts[ctx_sort].float()
-
-    uniq_ctx, inverse = torch.unique_consecutive(ctx_s, return_inverse=True)
+    counts_s = final_counts[ctx_sort].float()
+    uniq_ctx, inv2 = torch.unique_consecutive(ctx_s, return_inverse=True)
     nc = uniq_ctx.numel()
     totals = torch.zeros(nc, dtype=torch.float32, device=device)
-    totals.scatter_add_(0, inverse, counts_s)
+    totals.scatter_add_(0, inv2, counts_s)
     c1 = torch.zeros(nc, dtype=torch.float32, device=device)
-    c1.scatter_add_(0, inverse, (counts_s == 1).float())
+    c1.scatter_add_(0, inv2, (counts_s == 1).float())
     c2 = torch.zeros(nc, dtype=torch.float32, device=device)
-    c2.scatter_add_(0, inverse, (counts_s == 2).float())
+    c2.scatter_add_(0, inv2, (counts_s == 2).float())
     uf = torch.zeros(nc, dtype=torch.float32, device=device)
-    uf.scatter_add_(0, inverse, torch.ones(counts_s.numel(), dtype=torch.float32, device=device))
+    uf.scatter_add_(0, inv2, torch.ones(counts_s.numel(), dtype=torch.float32, device=device))
 
-    return uniq_ng, ng_counts, uniq_ctx, totals, c1, c2, uf, n1, n2, n3
+    del all_keys, all_counts, all_ctx, sort_idx
+    torch.cuda.empty_cache() if device.type == 'cuda' else None
+
+    return uniq_ng, final_counts, uniq_ctx, totals, c1, c2, uf, n1, n2, n3
 
 
 def build(encoded: List[np.ndarray], V: int, max_order: int, device: torch.device) -> Dict:
+    import time
     primes_ng = torch.tensor(_PRIMES[:max_order + 1], dtype=torch.int64, device=device)
     primes_ctx = torch.tensor(_PRIMES[:max_order], dtype=torch.int64, device=device)
 
@@ -71,11 +137,11 @@ def build(encoded: List[np.ndarray], V: int, max_order: int, device: torch.devic
     ctx_c1 = [None] * (max_order + 1)
     ctx_c2 = [None] * (max_order + 1)
     ctx_uf = [None] * (max_order + 1)
-
     n1_all = n2_all = n3_all = 0
 
     for order in range(1, max_order + 1):
-        r = _collect_order(encoded, order, primes_ng, primes_ctx, device)
+        t0 = time.time()
+        r = _collect_order_chunked(encoded, order, primes_ng, primes_ctx, device)
         u_ng, u_cnt, u_ctx, u_tot, u_c1, u_c2, u_uf, n1, n2, n3 = r
         if u_ng is None:
             continue
@@ -87,6 +153,7 @@ def build(encoded: List[np.ndarray], V: int, max_order: int, device: torch.devic
         ctx_c2[order] = u_c2
         ctx_uf[order] = u_uf
         n1_all += n1; n2_all += n2; n3_all += n3
+        print(f"    order {order}: {u_ng.numel():,} ngrams  ({time.time()-t0:.1f}s)")
 
     if n1_all > 0 and n2_all > 0:
         Y = n1_all / (n1_all + 2.0 * n2_all)
@@ -105,25 +172,21 @@ def build(encoded: List[np.ndarray], V: int, max_order: int, device: torch.devic
         cont.scatter_add_(0, (uniq % V).long(),
                           torch.ones(uniq.numel(), dtype=torch.float32, device=device))
 
-    # Sparse bigram transition matrix for fast adoption
-    bg_rows_all, bg_cols_all = [], []
+    bg_trans = None
+    bg_r, bg_c = [], []
     for arr in encoded:
         if arr.size < 2:
             continue
         t = torch.from_numpy(arr.astype(np.int64)).to(device)
-        bg_rows_all.append(t[:-1])
-        bg_cols_all.append(t[1:])
-    bg_trans = None
-    if bg_rows_all:
-        r_all = torch.cat(bg_rows_all)
-        c_all = torch.cat(bg_cols_all)
-        pk = r_all * V + c_all
-        u_pk, u_cnt = torch.unique(pk, return_counts=True)
-        r_u = (u_pk // V).long()
-        c_u = (u_pk % V).long()
+        bg_r.append(t[:-1]); bg_c.append(t[1:])
+    if bg_r:
+        all_r = torch.cat(bg_r); all_c = torch.cat(bg_c)
+        pk = all_r * V + all_c
+        u, uc = torch.unique(pk, return_counts=True)
+        r_u = (u // V).long(); c_u = (u % V).long()
         rs = torch.zeros(V, dtype=torch.float32, device=device)
-        rs.scatter_add_(0, r_u, u_cnt.float())
-        w = u_cnt.float() / rs[r_u].clamp(min=1.0)
+        rs.scatter_add_(0, r_u, uc.float())
+        w = uc.float() / rs[r_u].clamp(min=1.0)
         bg_trans = torch.sparse_coo_tensor(torch.stack([r_u, c_u]), w, (V, V)).coalesce()
 
     print(f"  KN-{max_order}: D1={D1:.3f} D2={D2:.3f} D3={D3:.3f}")
@@ -149,18 +212,14 @@ def _lookup(sk, sv, q):
 
 
 def score_all(kn: Dict, context_ids: List[int]) -> torch.Tensor:
-    """Score all V next tokens. Returns [V] probability distribution."""
     V, device = kn["V"], kn["device"]
     mo = kn["max_order"]
     primes = kn["primes"]
     targets = torch.arange(V, dtype=torch.int64, device=device)
-
     ctx = context_ids[-(mo):] if len(context_ids) >= mo else context_ids
     padded = [0] * (mo - len(ctx)) + list(ctx)
-
     p = kn["cont"][targets] / max(kn["total_ub"], 1)
     p = p.clamp(min=1e-10)
-
     for order in range(1, mo + 1):
         if kn["ng_keys"][order] is None:
             continue
@@ -168,21 +227,18 @@ def score_all(kn: Dict, context_ids: List[int]) -> torch.Tensor:
         if len(padded) - cs < order:
             continue
         ctx_slice = padded[cs:cs + order]
-
         ng_h = torch.zeros(V, dtype=torch.int64, device=device)
         ctx_h_val = 0
         for k in range(order):
             ng_h = ng_h + ctx_slice[k] * primes[k]
             ctx_h_val += ctx_slice[k] * int(primes[k].item())
         ng_h = ng_h + targets * primes[order]
-
         c = _lookup(kn["ng_keys"][order], kn["ng_counts"][order], ng_h)
         ctx_q = torch.tensor([ctx_h_val], dtype=torch.int64, device=device)
         ct = _lookup(kn["ctx_keys"][order], kn["ctx_totals"][order], ctx_q).item()
         c1v = _lookup(kn["ctx_keys"][order], kn["ctx_c1"][order], ctx_q).item()
         c2v = _lookup(kn["ctx_keys"][order], kn["ctx_c2"][order], ctx_q).item()
         ufv = _lookup(kn["ctx_keys"][order], kn["ctx_uf"][order], ctx_q).item()
-
         if ct < 1:
             continue
         D = torch.where(c >= 3, kn["D3"], torch.where(c >= 2, kn["D2"],
@@ -191,5 +247,4 @@ def score_all(kn: Dict, context_ids: List[int]) -> torch.Tensor:
         n3p = max(ufv - c1v - c2v, 0)
         lam = (kn["D1"] * c1v + kn["D2"] * c2v + kn["D3"] * n3p) / ct
         p = disc + lam * p
-
     return p / p.sum().clamp(min=1e-9)
