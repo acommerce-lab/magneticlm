@@ -125,7 +125,7 @@ def eval_kn_layers(
         print(f"    [{name:25s}] PPL={ppl:.2f}  hit@1={r['hit@1']:.4f}  hit@5={r['hit@5']:.4f}")
 
     # 0. Direct bigram matrix (sanity check — bypasses hash scoring)
-    bg = subs.get("bg_trans") or kn.get("bg_trans")
+    bg = subs.get("bg_trans") if "bg_trans" in subs else kn.get("bg_trans")
     if bg is not None:
         def _bg_score(ctx, hist, cur):
             selector = torch.zeros(V, dtype=torch.float32, device=device)
