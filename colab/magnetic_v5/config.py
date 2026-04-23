@@ -30,7 +30,7 @@ class Config:
     # Scoring mix
     stat_cache_window: int = 3000
     stat_cache_lambda: float = 0.12
-    adoption_lambda: float = 0.08
+    adoption_lambda: float = 0.30
 
     # Eval
     eval_ppl: bool = True
