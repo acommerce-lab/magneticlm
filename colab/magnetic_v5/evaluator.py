@@ -90,16 +90,19 @@ def eval_kn_layers(
     def _run(name, score_fn):
         nll, n, h1, h5 = 0.0, 0, 0, 0
         history = []
+        unk_id = getattr(cfg, 'unk_id', -1)
         for i in range(n_eval):
             ctx = flat[max(0, i - kn["max_order"]):i + 1].tolist()
             tgt = int(flat[i + 1])
             dist = score_fn(ctx, history, int(flat[i]))
-            if cfg.mask_unk and hasattr(cfg, 'unk_id'):
-                dist[cfg.unk_id] = 0.0
-                dist = dist / dist.sum().clamp(min=1e-9)
+            # Do NOT mask unk for PPL — masking makes unk targets get p=0
             p = float(dist[tgt].item())
             nll += -math.log(max(p, 1e-12))
-            _, top = torch.topk(dist, 50)
+            # For hit@k, mask unk so it doesn't steal top positions
+            dist_masked = dist.clone()
+            if unk_id >= 0:
+                dist_masked[unk_id] = 0.0
+            _, top = torch.topk(dist_masked, 50)
             tl = top.tolist()
             if tgt in tl[:1]: h1 += 1
             if tgt in tl[:5]: h5 += 1
