@@ -112,6 +112,18 @@ def eval_kn_layers(
         results[name] = r
         print(f"    [{name:25s}] PPL={ppl:.2f}  hit@1={r['hit@1']:.4f}  hit@5={r['hit@5']:.4f}")
 
+    # 0. Direct bigram matrix (sanity check — bypasses hash scoring)
+    bg = kn.get("bg_trans")
+    if bg is not None:
+        def _bg_score(ctx, hist, cur):
+            selector = torch.zeros(V, dtype=torch.float32, device=device)
+            selector[cur] = 1.0
+            dist = torch.sparse.mm(bg.t(), selector.unsqueeze(1)).squeeze(1)
+            eps = 0.05
+            dist = (1 - eps) * dist + eps * (1.0 / V)
+            return dist / dist.sum().clamp(min=1e-9)
+        _run("bigram (sparse matrix)", _bg_score)
+
     # 1. KN only
     _run("KN-5gram", lambda ctx, hist, cur: kn_score(kn, ctx))
 
