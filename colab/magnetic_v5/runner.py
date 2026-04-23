@@ -81,18 +81,26 @@ def run_pipeline(cfg: Config) -> Dict:
     mon.snapshot("after-subs")
 
     print("Running evaluation...")
+    t_eval = time.time()
     results: Dict = {}
 
     print("  [eval] KN layer diagnostics...")
+    t0 = time.time()
     results["kn_layers"] = eval_kn_layers(kn, subs, enc_valid, cfg, res.primary_device)
+    print(f"  KN layers eval in {time.time()-t0:.1f}s")
 
     print("  [eval] Substitution quality...")
+    t0 = time.time()
     results["subs_quality"] = eval_subs_quality(subs, vocab, res.primary_device)
+    print(f"  subs quality in {time.time()-t0:.1f}s")
 
     if cfg.eval_ood_cloze:
         print("  [eval] OOD cloze...")
+        t0 = time.time()
         results["ood"] = eval_ood(kn, subs, vocab, cfg, res.primary_device)
+        print(f"  OOD eval in {time.time()-t0:.1f}s")
 
+    print(f"  Total eval: {time.time()-t_eval:.1f}s")
     mon.snapshot("post-eval")
 
     os.makedirs(cfg.save_dir, exist_ok=True)

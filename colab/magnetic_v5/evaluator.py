@@ -40,7 +40,59 @@ def _decay_boost(history: List[int], V: int, device: torch.device) -> torch.Tens
     return b / s if s > 1e-9 else b
 
 
-def _adoption_dist(kn, subs, current, context, V, device):
+def _batch_adoption(subs, contexts, V, device):
+    """Batch ALL adoption distributions in ONE sparse matmul.
+
+    Instead of n_eval individual sparse_mm calls, build a [V, n_eval]
+    matrix of IDF-weighted context vectors, then ONE sparse_mm.
+    """
+    ppmi = subs.get("ppmi_matrix")
+    idf = subs.get("idf")
+    glow = subs.get("glow")
+    n = len(contexts)
+
+    if ppmi is None or n == 0:
+        return torch.zeros(n, V, dtype=torch.float32, device=device)
+
+    # Build [V, n] context matrix (all tokens at once)
+    ctx_mat = torch.zeros(V, n, dtype=torch.float32, device=device)
+    for i, ctx in enumerate(contexts):
+        ctx_words = ctx[-8:] if ctx else []
+        w = 1.0
+        for t in reversed(ctx_words):
+            if 0 <= t < V:
+                idf_w = float(idf[t].item()) if idf is not None else 1.0
+                ctx_mat[t, i] += w * idf_w
+            w *= 0.7
+
+    # Normalize each column
+    col_sums = ctx_mat.sum(dim=0, keepdim=True).clamp(min=1e-9)
+    ctx_mat = ctx_mat / col_sums
+
+    # ONE sparse matmul: PPMI.T @ [V, n] → [V, n]
+    result = torch.sparse.mm(ppmi.t(), ctx_mat)  # [V, n]
+
+    # Sharpen: element-wise square + top-K truncation per column
+    result = result ** 2
+    if V > 100:
+        threshold = result.topk(100, dim=0).values[-1:, :]  # [1, n]
+        result = result * (result >= threshold).float()
+
+    # Apply glow
+    if glow is not None:
+        result = result * (1.0 + glow.unsqueeze(1))
+
+    # Zero context words
+    for i, ctx in enumerate(contexts):
+        for t in ctx[-8:]:
+            if 0 <= t < V:
+                result[t, i] = 0.0
+
+    # Normalize each column
+    s = result.sum(dim=0, keepdim=True).clamp(min=1e-9)
+    result = result / s
+
+    return result.t()  # [n, V]
     """IDF-weighted 1-hop PPMI lookup — no multi-hop diffusion.
 
     Function words (the, of, and) get near-zero weight in the context seed
@@ -123,7 +175,14 @@ def eval_kn_layers(
         targets_list.append(int(flat[i + 1]))
         kn_dists.append(kn_score(kn, ctx))
 
+    # Pre-compute ALL adoption distributions in ONE batch matmul
+    print("    pre-computing adoption distributions (batch)...")
+    t1 = time.time()
+    all_adopt = _batch_adoption(subs, contexts, V, device)  # [n_eval, V]
+    print(f"    adoption batch done in {time.time()-t1:.1f}s")
+
     def _eval(name, make_dist_fn):
+        t_start = time.time()
         nll, n, h1, h5 = 0.0, 0, 0, 0
         history = []
         for i in range(n_eval):
@@ -145,7 +204,8 @@ def eval_kn_layers(
         ppl = math.exp(nll / max(n, 1))
         r = {"ppl": ppl, "hit@1": h1 / max(n, 1), "hit@5": h5 / max(n, 1)}
         results[name] = r
-        print(f"    [{name:25s}] PPL={ppl:.2f}  hit@1={r['hit@1']:.4f}  hit@5={r['hit@5']:.4f}")
+        elapsed = time.time() - t_start
+        print(f"    [{name:25s}] PPL={ppl:.2f}  hit@1={r['hit@1']:.4f}  hit@5={r['hit@5']:.4f}  ({elapsed:.1f}s)")
 
     # 0. Bigram matrix
     bg = subs.get("bg_trans") if "bg_trans" in subs else kn.get("bg_trans")
@@ -165,12 +225,11 @@ def eval_kn_layers(
           (1 - lam_s) * kn_d + lam_s * _decay_boost(h, V, device))
 
     _eval("KN + adoption", lambda i, kn_d, h, c:
-          (1 - lam_a) * kn_d + lam_a * _adoption_dist(kn, subs, c, contexts[i], V, device))
+          (1 - lam_a) * kn_d + lam_a * all_adopt[i])
 
     def _full(i, kn_d, h, c):
         cache = _decay_boost(h, V, device)
-        adopt = _adoption_dist(kn, subs, c, contexts[i], V, device)
-        return (1 - lam_s - lam_a) * kn_d + lam_s * cache + lam_a * adopt
+        return (1 - lam_s - lam_a) * kn_d + lam_s * cache + lam_a * all_adopt[i]
     _eval("KN + cache + diffusion", _full)
 
     return results
