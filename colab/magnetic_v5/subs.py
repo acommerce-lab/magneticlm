@@ -178,8 +178,16 @@ def build(
     bg_norm = bg_val / row_sums[bg_idx[0]].clamp(min=1.0)
     bg_trans = torch.sparse_coo_tensor(bg_idx, bg_norm, (V, V)).coalesce()
 
+    # IDF for context weighting: suppress function words in diffusion seed
+    m_idx = M.indices()
+    m_val = M.values()
+    degree = torch.zeros(V, dtype=torch.float32, device=device)
+    degree.scatter_add_(0, m_idx[0], torch.ones_like(m_val))
+    idf = 1.0 / (1.0 + degree.sqrt())
+    idf = idf / idf.max().clamp(min=1e-9)
+
     return dict(
         sub_ids=sub_ids, sub_wts=sub_wts,
         glow=glow, bg_trans=bg_trans,
-        ppmi_matrix=M, K=K, V=V,
+        ppmi_matrix=M, idf=idf, K=K, V=V,
     )

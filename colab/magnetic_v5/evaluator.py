@@ -40,41 +40,50 @@ def _decay_boost(history: List[int], V: int, device: torch.device) -> torch.Tens
     return b / s if s > 1e-9 else b
 
 
-def _adoption_dist(kn, subs, current, context, V, device, n_hops=3, damping=0.7):
-    """Multi-hop PPMI diffusion: seed from context, spread through semantic graph."""
+def _adoption_dist(kn, subs, current, context, V, device):
+    """IDF-weighted 1-hop PPMI lookup — no multi-hop diffusion.
+
+    Function words (the, of, and) get near-zero weight in the context seed
+    via IDF. Content words (king, paris, capital) get high weight.
+    Then ONE sparse matmul: PPMI.T @ idf_weighted_context.
+
+    This avoids the hub-convergence problem of multi-hop diffusion.
+    """
     ppmi = subs.get("ppmi_matrix")
+    idf = subs.get("idf")
     if ppmi is None:
         return torch.zeros(V, dtype=torch.float32, device=device)
 
+    # IDF-weighted context seed: rare words contribute more
     v = torch.zeros(V, dtype=torch.float32, device=device)
-    ctx_words = context[-5:] if context else []
+    ctx_words = context[-8:] if context else []
     w = 1.0
     for t in reversed(ctx_words):
         if 0 <= t < V:
-            v[t] += w
+            idf_w = float(idf[t].item()) if idf is not None else 1.0
+            v[t] += w * idf_w
         w *= 0.7
     if v.sum() < 1e-9:
         return torch.zeros(V, dtype=torch.float32, device=device)
     v = v / v.sum()
 
-    accumulated = torch.zeros(V, dtype=torch.float32, device=device)
-    for hop in range(n_hops):
-        v = torch.sparse.mm(ppmi.t(), v.unsqueeze(1)).squeeze(1)
-        v = v * damping
-        accumulated = accumulated + v * (damping ** hop)
+    # Single hop: PPMI neighbors of the IDF-weighted context
+    result = torch.sparse.mm(ppmi.t(), v.unsqueeze(1)).squeeze(1)
 
+    # Apply glow
     glow = subs.get("glow")
     if glow is not None:
-        accumulated = accumulated * (1.0 + glow)
+        result = result * (1.0 + glow)
 
+    # Zero out context words (no echo)
     for t in ctx_words:
         if 0 <= t < V:
-            accumulated[t] = 0.0
+            result[t] = 0.0
 
-    s = accumulated.sum()
+    s = result.sum()
     if s > 1e-9:
-        accumulated = accumulated / s
-    return accumulated
+        result = result / s
+    return result
 
 
 def eval_kn_layers(
