@@ -40,63 +40,84 @@ def _row_norms(M: torch.Tensor, V: int, device: torch.device) -> torch.Tensor:
     return norms.sqrt().clamp(min=1e-9)
 
 
+def _is_xla(device):
+    return hasattr(device, 'type') and str(device).startswith('xla')
+
+
 def _cosine_topk_blocked(
     M: torch.Tensor, V: int, K: int, block_size: int, device: torch.device,
 ) -> Tuple[torch.Tensor, torch.Tensor, int]:
-    """Compute cosine similarity in blocks. Returns (ids[V,K], weights[V,K], n_found)."""
+    """Cosine similarity in blocks. Auto-selects dense (TPU) or sparse (GPU/CPU) path."""
+
+    # TPU/XLA path: convert to dense, use fast dense matmul
+    if _is_xla(device) or not M.is_sparse:
+        return _cosine_topk_dense(M if not M.is_sparse else M.to_dense(), V, K, block_size, device)
+
+    # Sparse path (GPU/CPU)
     M = M.coalesce()
     norms = _row_norms(M, V, device)
-
     ids = torch.zeros(V, K, dtype=torch.int64, device=device)
     wts = torch.zeros(V, K, dtype=torch.float32, device=device)
     n_found = 0
-
     m_idx = M.indices()
     m_val = M.values()
 
     for start in range(0, V, block_size):
         end = min(start + block_size, V)
         bs = end - start
-
-        # Extract block rows as dense [bs, V]
         block = torch.zeros(bs, V, dtype=torch.float32, device=device)
         mask = (m_idx[0] >= start) & (m_idx[0] < end)
         if mask.any():
             block[m_idx[0][mask] - start, m_idx[1][mask]] = m_val[mask]
-
         if block.abs().sum() == 0:
             continue
-
-        # Normalize block rows
-        block_norms = norms[start:end].unsqueeze(1)
-        block_normed = block / block_norms
-
-        # Cosine: block_normed @ M_normed.T
-        # = block_normed @ (M / norms).T
-        # Use sparse: M.T @ block_normed.T → [V, bs] → transpose
-        raw = torch.sparse.mm(M.t(), block_normed.t()).t()  # [bs, V]
-        # Divide by target norms
+        block_normed = block / norms[start:end].unsqueeze(1)
+        raw = torch.sparse.mm(M.t(), block_normed.t()).t()
         raw = raw / norms.unsqueeze(0)
-
-        # Zero self-similarity
         for i in range(bs):
             w = start + i
             if w < V:
                 raw[i, w] = 0.0
-
         vals, idx_k = torch.topk(raw, min(K, V), dim=1)
         for i in range(bs):
             w = start + i
-            if w >= V:
-                break
+            if w >= V: break
             nv = int((vals[i] > 0).sum().item())
             nt = min(nv, K)
             if nt > 0:
                 ids[w, :nt] = idx_k[i, :nt]
                 wts[w, :nt] = vals[i, :nt]
                 n_found += 1
+    ws = wts.sum(dim=1, keepdim=True).clamp(min=1e-9)
+    wts = wts / ws
+    return ids, wts, n_found
 
-    # Normalize weights per word (for mixing)
+
+def _cosine_topk_dense(M_dense, V, K, block_size, device):
+    """Dense path: M_dense @ M_dense.T in blocks. Fast on TPU."""
+    norms = M_dense.norm(dim=1).clamp(min=1e-9)
+    M_normed = M_dense / norms.unsqueeze(1)
+
+    ids = torch.zeros(V, K, dtype=torch.int64, device=device)
+    wts = torch.zeros(V, K, dtype=torch.float32, device=device)
+    n_found = 0
+
+    for start in range(0, V, block_size):
+        end = min(start + block_size, V)
+        # Dense matmul: [bs, V] @ [V, V].T = [bs, V]
+        raw = torch.mm(M_normed[start:end], M_normed.t())
+        # Zero self-similarity
+        for i in range(end - start):
+            raw[i, start + i] = 0.0
+        vals, idx_k = torch.topk(raw, min(K, V), dim=1)
+        for i in range(end - start):
+            w = start + i
+            nv = int((vals[i] > 0).sum().item())
+            nt = min(nv, K)
+            if nt > 0:
+                ids[w, :nt] = idx_k[i, :nt]
+                wts[w, :nt] = vals[i, :nt]
+                n_found += 1
     ws = wts.sum(dim=1, keepdim=True).clamp(min=1e-9)
     wts = wts / ws
     return ids, wts, n_found
@@ -186,8 +207,14 @@ def build(
     idf = 1.0 / (1.0 + degree.sqrt())
     idf = idf / idf.max().clamp(min=1e-9)
 
+    # On TPU/XLA: convert PPMI to dense for fast matmul
+    ppmi_out = M
+    if _is_xla(device):
+        print("    converting PPMI to dense for TPU...")
+        ppmi_out = M.to_dense()
+
     return dict(
         sub_ids=sub_ids, sub_wts=sub_wts,
         glow=glow, bg_trans=bg_trans,
-        ppmi_matrix=M, idf=idf, K=K, V=V,
+        ppmi_matrix=ppmi_out, idf=idf, K=K, V=V,
     )

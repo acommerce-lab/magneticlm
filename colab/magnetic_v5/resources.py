@@ -21,6 +21,12 @@ from typing import Dict, List, Optional
 import torch
 
 try:
+    import torch_xla.core.xla_model as xm
+    _HAS_XLA = True
+except ImportError:
+    _HAS_XLA = False
+
+try:
     import psutil
     _HAS_PSUTIL = True
 except ImportError:
@@ -49,17 +55,27 @@ def detect(cfg) -> Resources:
         num_cpus = cpu_count
 
     cuda_ok = torch.cuda.is_available()
-    if cfg.device == "cpu" or not cuda_ok:
+    device_str = getattr(cfg, "device", "auto")
+
+    if device_str == "cpu":
         num_gpus = 0
         gpu_ids: List[int] = []
         primary = torch.device("cpu")
-    else:
+    elif cuda_ok:
         num_gpus = torch.cuda.device_count()
         gpu_ids = list(range(num_gpus))
-        if cfg.device.startswith("cuda:"):
-            primary = torch.device(cfg.device)
-        else:
-            primary = torch.device("cuda:0")
+        primary = torch.device(device_str if device_str.startswith("cuda:") else "cuda:0")
+    elif _HAS_XLA:
+        # TPU detected via torch_xla
+        primary = xm.xla_device()
+        num_gpus = 0  # not CUDA GPUs
+        gpu_ids = []
+        n_chips = xm.xrt_world_size() if hasattr(xm, 'xrt_world_size') else 1
+        print(f"  TPU detected: {primary}  chips={n_chips}")
+    else:
+        num_gpus = 0
+        gpu_ids = []
+        primary = torch.device("cpu")
 
     multi_gpu = cfg.multi_gpu and num_gpus > 1
     return Resources(

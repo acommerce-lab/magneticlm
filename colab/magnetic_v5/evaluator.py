@@ -69,8 +69,12 @@ def _batch_adoption(subs, contexts, V, device):
     col_sums = ctx_mat.sum(dim=0, keepdim=True).clamp(min=1e-9)
     ctx_mat = ctx_mat / col_sums
 
-    # ONE sparse matmul: PPMI.T @ [V, n] → [V, n]
-    result = torch.sparse.mm(ppmi.t(), ctx_mat)  # [V, n]
+    # ONE matmul: PPMI.T @ [V, n] → [V, n]
+    # Dense path for TPU/XLA, sparse for GPU/CPU
+    if ppmi.is_sparse:
+        result = torch.sparse.mm(ppmi.t(), ctx_mat)
+    else:
+        result = torch.mm(ppmi.t(), ctx_mat)
 
     # Sharpen: element-wise square + top-K truncation per column
     result = result ** 2
