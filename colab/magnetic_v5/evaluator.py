@@ -40,59 +40,41 @@ def _decay_boost(history: List[int], V: int, device: torch.device) -> torch.Tens
     return b / s if s > 1e-9 else b
 
 
-def _adoption_dist(kn: Dict, subs: Dict, current: int, context: List[int], V: int, device: torch.device, lam_step: float = 0.7) -> torch.Tensor:
-    """Adoption via substitutes' bigram children, weighted by sim × λ^d × glow.
-
-    Score(w) = Σ_s [ sim(current, s) × P_bigram(s→w) × λ^1 × glow(w) ]
-    Uses sparse matmul: selector @ bg_trans.T — one GPU operation.
-    """
-    bg = subs.get("bg_trans")
-    if bg is None:
-        return torch.zeros(V, dtype=torch.float32, device=device)
-
-    sub_ids = subs["sub_ids"][current]  # [K]
-    sub_wts = subs["sub_wts"][current]  # [K]
-
-    # Find active substitutes
-    active = sub_wts > 1e-6
-    if not active.any():
-        return torch.zeros(V, dtype=torch.float32, device=device)
-
-    a_ids = sub_ids[active]   # [A]
-    a_wts = sub_wts[active]   # [A]
-
-    # λ^d penalty: distance=1 hop through substitute
-    penalty = lam_step  # λ^1 for one-hop adoption
-
-    # Selector: weighted by sim × λ
-    selector = torch.zeros(V, dtype=torch.float32, device=device)
-    selector.scatter_add_(0, a_ids.long(), a_wts * penalty)
-
-    # adoption = selector @ bg_trans.T (substitute children)
-    adoption = torch.sparse.mm(bg.t(), selector.unsqueeze(1)).squeeze(1)
-
-    # Context-aligned glow: boost words whose semantic neighborhood
-    # overlaps with the current context (not just globally important)
-    glow = subs.get("glow")
+def _adoption_dist(kn, subs, current, context, V, device, n_hops=3, damping=0.7):
+    """Multi-hop PPMI diffusion: seed from context, spread through semantic graph."""
     ppmi = subs.get("ppmi_matrix")
-    if glow is not None and ppmi is not None and len(context) > 0:
-        # Build context vector from PPMI rows of context words
-        ctx_vec = torch.zeros(V, dtype=torch.float32, device=device)
-        for c in context[-5:]:
-            if 0 <= c < V:
-                ctx_vec[c] += 1.0
-        # Context-aligned glow = global glow × similarity to context
-        ctx_spread = torch.sparse.mm(ppmi.t(), ctx_vec.unsqueeze(1)).squeeze(1)
-        ctx_spread = ctx_spread / ctx_spread.sum().clamp(min=1e-9)
-        aligned_glow = glow * (1.0 + 5.0 * ctx_spread)
-        adoption = adoption * (1.0 + aligned_glow)
-    elif glow is not None:
-        adoption = adoption * (1.0 + glow)
+    if ppmi is None:
+        return torch.zeros(V, dtype=torch.float32, device=device)
 
-    s = adoption.sum()
+    v = torch.zeros(V, dtype=torch.float32, device=device)
+    ctx_words = context[-5:] if context else []
+    w = 1.0
+    for t in reversed(ctx_words):
+        if 0 <= t < V:
+            v[t] += w
+        w *= 0.7
+    if v.sum() < 1e-9:
+        return torch.zeros(V, dtype=torch.float32, device=device)
+    v = v / v.sum()
+
+    accumulated = torch.zeros(V, dtype=torch.float32, device=device)
+    for hop in range(n_hops):
+        v = torch.sparse.mm(ppmi.t(), v.unsqueeze(1)).squeeze(1)
+        v = v * damping
+        accumulated = accumulated + v * (damping ** hop)
+
+    glow = subs.get("glow")
+    if glow is not None:
+        accumulated = accumulated * (1.0 + glow)
+
+    for t in ctx_words:
+        if 0 <= t < V:
+            accumulated[t] = 0.0
+
+    s = accumulated.sum()
     if s > 1e-9:
-        adoption = adoption / s
-    return adoption
+        accumulated = accumulated / s
+    return accumulated
 
 
 def eval_kn_layers(
@@ -161,20 +143,13 @@ def eval_kn_layers(
     _run("KN + adoption", lambda ctx, hist, cur:
          (1 - lam_a) * kn_score(kn, ctx) + lam_a * _adoption_dist(kn, subs, cur, ctx, V, device))
 
-    # 4. KN + cache + adoption (COMPETITION: max of two channels)
+    # 4. KN + cache + diffusion (weighted sum — adoption is now multi-hop)
     def full_score(ctx, hist, cur):
-        kn_dist = kn_score(kn, ctx)
+        base = kn_score(kn, ctx)
         cache = _decay_boost(hist, V, device)
-        kn_cached = (1 - lam_s) * kn_dist + lam_s * cache
-
         adopt = _adoption_dist(kn, subs, cur, ctx, V, device)
-
-        # Competition: for each candidate, take the HIGHER of KN vs adoption
-        # This lets adoption override KN when it's confident
-        # But KN still wins for grammatical next-tokens
-        combined = torch.max(kn_cached, lam_a * adopt * 10.0)
-        return combined / combined.sum().clamp(min=1e-9)
-    _run("KN + cache + adoption", full_score)
+        return (1 - lam_s - lam_a) * base + lam_s * cache + lam_a * adopt
+    _run("KN + cache + diffusion", full_score)
 
     return results
 
