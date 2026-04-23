@@ -70,6 +70,14 @@ def _adoption_dist(kn, subs, current, context, V, device):
     # Single hop: PPMI neighbors of the IDF-weighted context
     result = torch.sparse.mm(ppmi.t(), v.unsqueeze(1)).squeeze(1)
 
+    # Sharpen: concentrate probability mass on top candidates
+    # Without this, rank=3 still gets p≈0.001 out of V=27K → drowns in KN
+    result = result ** 2
+    # Top-K truncation: keep only top 100, zero the rest
+    if result.numel() > 100:
+        threshold = result.topk(min(100, result.numel())).values[-1]
+        result = result * (result >= threshold).float()
+
     # Apply glow
     glow = subs.get("glow")
     if glow is not None:
@@ -90,7 +98,7 @@ def eval_kn_layers(
     kn: Dict, subs: Dict, encoded: List[np.ndarray],
     cfg, device: torch.device, max_tokens: int = 5000,
 ) -> Dict:
-    """Test each layer independently then combined."""
+    """Test each layer — compute KN once, reuse across all tests."""
     arrs = [a for a in encoded if a.size > 1]
     if not arrs:
         return {}
@@ -100,34 +108,70 @@ def eval_kn_layers(
     lam_s = cfg.stat_cache_lambda
     lam_a = cfg.adoption_lambda
     results = {}
+    unk_id = getattr(cfg, 'unk_id', -1)
 
-    def _run(name, score_fn):
+    # Pre-compute ALL KN distributions + contexts (compute once, reuse 5×)
+    print("    pre-computing KN distributions...")
+    kn_dists = []
+    contexts = []
+    currents = []
+    targets_list = []
+    for i in range(n_eval):
+        ctx = flat[max(0, i - kn["max_order"]):i + 1].tolist()
+        contexts.append(ctx)
+        currents.append(int(flat[i]))
+        targets_list.append(int(flat[i + 1]))
+        kn_dists.append(kn_score(kn, ctx))
+
+    def _eval(name, make_dist_fn):
         nll, n, h1, h5 = 0.0, 0, 0, 0
         history = []
-        unk_id = getattr(cfg, 'unk_id', -1)
         for i in range(n_eval):
-            ctx = flat[max(0, i - kn["max_order"]):i + 1].tolist()
-            tgt = int(flat[i + 1])
-            dist = score_fn(ctx, history, int(flat[i]))
-            # Do NOT mask unk for PPL — masking makes unk targets get p=0
+            dist = make_dist_fn(i, kn_dists[i], history, currents[i])
+            tgt = targets_list[i]
             p = float(dist[tgt].item())
             nll += -math.log(max(p, 1e-12))
-            # For hit@k, mask unk so it doesn't steal top positions
-            dist_masked = dist.clone()
+            dist_m = dist.clone()
             if unk_id >= 0:
-                dist_masked[unk_id] = 0.0
-            _, top = torch.topk(dist_masked, 50)
+                dist_m[unk_id] = 0.0
+            _, top = torch.topk(dist_m, 50)
             tl = top.tolist()
             if tgt in tl[:1]: h1 += 1
             if tgt in tl[:5]: h5 += 1
             n += 1
-            history.append(int(flat[i]))
+            history.append(currents[i])
             if len(history) > cfg.stat_cache_window:
                 history = history[-cfg.stat_cache_window:]
         ppl = math.exp(nll / max(n, 1))
         r = {"ppl": ppl, "hit@1": h1 / max(n, 1), "hit@5": h5 / max(n, 1)}
         results[name] = r
         print(f"    [{name:25s}] PPL={ppl:.2f}  hit@1={r['hit@1']:.4f}  hit@5={r['hit@5']:.4f}")
+
+    # 0. Bigram matrix
+    bg = subs.get("bg_trans") if "bg_trans" in subs else kn.get("bg_trans")
+    if bg is not None:
+        def _bg(i, kn_d, hist, cur):
+            sel = torch.zeros(V, dtype=torch.float32, device=device)
+            sel[cur] = 1.0
+            d = torch.sparse.mm(bg.t(), sel.unsqueeze(1)).squeeze(1)
+            d = (1 - 0.05) * d + 0.05 * (1.0 / V)
+            return d / d.sum().clamp(min=1e-9)
+        _eval("bigram (sparse matrix)", _bg)
+
+    # 1-4: all reuse pre-computed kn_dists
+    _eval("KN-5gram", lambda i, kn_d, h, c: kn_d)
+
+    _eval("KN + stat_cache", lambda i, kn_d, h, c:
+          (1 - lam_s) * kn_d + lam_s * _decay_boost(h, V, device))
+
+    _eval("KN + adoption", lambda i, kn_d, h, c:
+          (1 - lam_a) * kn_d + lam_a * _adoption_dist(kn, subs, c, contexts[i], V, device))
+
+    def _full(i, kn_d, h, c):
+        cache = _decay_boost(h, V, device)
+        adopt = _adoption_dist(kn, subs, c, contexts[i], V, device)
+        return (1 - lam_s - lam_a) * kn_d + lam_s * cache + lam_a * adopt
+    _eval("KN + cache + diffusion", _full)
 
     # 0. Direct bigram matrix (sanity check — bypasses hash scoring)
     bg = subs.get("bg_trans") if "bg_trans" in subs else kn.get("bg_trans")
