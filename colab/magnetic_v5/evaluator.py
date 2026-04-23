@@ -174,24 +174,50 @@ def eval_ood(kn: Dict, subs: Dict, vocab, cfg, device: torch.device) -> Dict:
             details.append({"context": context, "answer": answer, "skipped": True})
             continue
 
+        # Test THREE scoring modes for each OOD case:
         base = kn_score(kn, toks)
         cache = _decay_boost(toks, V, device)
         cur = toks[-1]
         adopt = _adoption_dist(kn, subs, cur, toks, V, device)
+
+        # Mode 1: KN+cache only (statistical)
+        dist_kn = (1 - lam_s) * base + lam_s * cache
+        dist_kn[vocab.unk_id] = 0.0
+        dist_kn = dist_kn / dist_kn.sum().clamp(min=1e-9)
+
+        # Mode 2: Diffusion only (semantic — isolated concept test)
+        dist_diff = adopt.clone()
+        dist_diff[vocab.unk_id] = 0.0
+        s = dist_diff.sum()
+        if s > 1e-9:
+            dist_diff = dist_diff / s
+
+        # Mode 3: Combined
         dist = (1 - lam_s - lam_a) * base + lam_s * cache + lam_a * adopt
         dist[vocab.unk_id] = 0.0
         dist = dist / dist.sum().clamp(min=1e-9)
 
-        _, idx = torch.topk(dist, 50)
-        top = idx.tolist()
-        rank = top.index(tgt) + 1 if tgt in top else None
+        # Rank in each mode
+        def _rank(d, t):
+            _, idx = torch.topk(d, 50)
+            top = idx.tolist()
+            return top.index(t) + 1 if t in top else None, [vocab.itos[i] if i < len(vocab.itos) else "?" for i in top[:5]]
+
+        rank_kn, top5_kn = _rank(dist_kn, tgt)
+        rank_diff, top5_diff = _rank(dist_diff, tgt)
+        rank, top5 = _rank(dist, tgt)
+
         if rank is not None:
             if rank <= 1: hits[1] += 1
             if rank <= 5: hits[5] += 1
             if rank <= 10: hits[10] += 1
         total += 1
-        top5 = [vocab.itos[i] if i < len(vocab.itos) else "?" for i in top[:5]]
-        details.append({"context": context, "answer": answer, "rank": rank, "top5_words": top5})
+        details.append({
+            "context": context, "answer": answer,
+            "rank_kn": rank_kn, "top5_kn": top5_kn,
+            "rank_diff": rank_diff, "top5_diff": top5_diff,
+            "rank": rank, "top5_words": top5,
+        })
 
     recall = {f"ood_hit@{k}": hits[k] / max(total, 1) for k in [1, 5, 10]}
     recall["ood_total"] = total
@@ -203,9 +229,12 @@ def eval_ood(kn: Dict, subs: Dict, vocab, cfg, device: torch.device) -> Dict:
         if d.get("skipped"):
             print(f"      [{d['context']!r}] -> SKIPPED")
             continue
-        r = str(d["rank"]) if d["rank"] else ">50"
-        t5 = " ".join(d.get("top5_words", []))
-        print(f"      [{d['context']!r}] -> rank={r}  top5=[{t5}]")
+        rk = str(d.get("rank_kn") or ">50")
+        rd = str(d.get("rank_diff") or ">50")
+        rc = str(d.get("rank") or ">50")
+        t5d = " ".join(d.get("top5_diff", []))
+        t5c = " ".join(d.get("top5_words", []))
+        print(f"      [{d['context']!r}] -> '{d['answer']}' KN={rk} DIFF={rd} MIX={rc}  diff_top5=[{t5d}]")
     return recall
 
 
