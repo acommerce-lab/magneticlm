@@ -8,7 +8,7 @@ _PRIMES = [1, 10007, 100003, 1000003, 10000019, 100000007,
            1000000007, 10000000019, 100000000003]
 
 
-def _collect_order_chunked(encoded, order, primes_ng, primes_ctx, device, chunk_tokens=4_000_000):
+def _collect_order_chunked(encoded, order, primes_ng, primes_ctx, device, chunk_tokens=2_000_000):
     """Chunked collection: concat sentences, compute hashes, reduce per chunk, merge."""
     valid = [a for a in encoded if a.size >= order + 1]
     if not valid:
@@ -138,6 +138,8 @@ def build(encoded: List[np.ndarray], V: int, max_order: int, device: torch.devic
 
     for order in range(1, max_order + 1):
         t0 = time.time()
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
         r = _collect_order_chunked(encoded, order, primes_ng, primes_ctx, device)
         u_ng, u_cnt, u_ctx, u_tot, u_c1, u_c2, u_uf, n1, n2, n3 = r
         if u_ng is None:
