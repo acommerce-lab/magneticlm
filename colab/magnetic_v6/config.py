@@ -13,7 +13,11 @@ class Config:
 
     # Statistics
     stat_window: int = 5
+    bigram_window: int = 1
     min_pair_count: int = 2
+    cost_smoothing: float = 1.0
+    cost_ceiling: float = 20.0
+    max_out_edges: int = 200
 
     # Embedding: SVD on PPMI
     embed_dim: int = 100          # SVD dimensions
