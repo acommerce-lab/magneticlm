@@ -22,6 +22,8 @@ class Config:
     # Embedding: SVD on PPMI
     embed_dim: int = 100          # SVD dimensions
     min_ppmi: float = 0.5
+    embed_method: str = "svd"     # "svd" | "basis" (independent dominating set)
+    basis_k: int = 1000           # basis size when embed_method="basis"
 
     # Attention
     n_heads: int = 3              # context + predecessor + KN

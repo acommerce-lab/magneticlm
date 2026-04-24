@@ -62,6 +62,100 @@ def build_embeddings(ctx_rows, ctx_cols, ctx_counts, unigram, V, d, min_ppmi, de
     return embeddings, idf
 
 
+def build_embeddings_basis(ctx_rows, ctx_cols, ctx_counts, unigram, V, k, min_ppmi, device):
+    """Build [V, k] word vectors using PPMI columns from an independent
+    dominating set as basis dimensions.
+
+    Steps:
+      1. Build PPMI matrix (same as SVD path).
+      2. Greedy independent dominating set: pick k words that don't share
+         edges but cover the vocabulary.
+      3. Embedding[w] = PPMI[w, basis_words].
+
+    Preserves raw PPMI values (no lossy compression) and keeps dimensions
+    interpretable (each dim = a real word).
+    """
+    t0 = time.time()
+
+    total = ctx_counts.sum().clamp(min=1.0)
+    N = unigram.float().sum().clamp(min=1.0)
+    p_ab = ctx_counts / total
+    p_a = unigram[ctx_rows].float() / N
+    p_b = unigram[ctx_cols].float() / N
+    ppmi = torch.log((p_ab + 1e-12) / (p_a * p_b + 1e-12)).clamp(min=0.0)
+    keep = ppmi >= min_ppmi
+    rows_f, cols_f, vals_f = ctx_rows[keep], ctx_cols[keep], ppmi[keep]
+
+    # Sparse PPMI on CPU for basis selection
+    idx = torch.stack([rows_f.cpu(), cols_f.cpu()])
+    M = torch.sparse_coo_tensor(idx, vals_f.cpu().float(), (V, V)).coalesce()
+
+    # Degree per word (number of edges)
+    degree = torch.zeros(V, dtype=torch.float32)
+    degree.scatter_add_(0, rows_f.cpu(), torch.ones(rows_f.numel(), dtype=torch.float32))
+
+    # Build neighbor lists (CPU) for greedy IDS
+    print(f"    selecting independent dominating set (target k={k})...")
+    M_csr = M.to_sparse_csr()
+    crow = M_csr.crow_indices()
+    cols = M_csr.col_indices()
+
+    # Greedy: sort by degree descending, pick high-degree words that don't
+    # conflict with already-picked (no shared edge). Stop when we have k.
+    order = torch.argsort(degree, descending=True).tolist()
+    picked = []
+    blocked = torch.zeros(V, dtype=torch.bool)
+    covered = torch.zeros(V, dtype=torch.bool)
+
+    for w in order:
+        if len(picked) >= k:
+            break
+        if blocked[w]:
+            continue
+        picked.append(w)
+        covered[w] = True
+        # Block all neighbors of w (they share an edge with w)
+        start, end = int(crow[w].item()), int(crow[w + 1].item())
+        neigh = cols[start:end]
+        blocked[neigh] = True
+        blocked[w] = True
+        covered[neigh] = True
+
+    # If we didn't reach k, fill with highest-degree remaining (drop independence)
+    if len(picked) < k:
+        picked_set = set(picked)
+        for w in order:
+            if len(picked) >= k:
+                break
+            if w not in picked_set:
+                picked.append(w)
+                picked_set.add(w)
+
+    basis = torch.tensor(picked[:k], dtype=torch.int64)
+    cov = int(covered.sum().item())
+    print(f"    basis: {len(picked)} words, covered={cov}/{V} ({100*cov/V:.1f}%)")
+
+    # Embedding = PPMI[:, basis]  →  [V, k]
+    # Build by filtering the sparse triplets: keep entries whose col is in basis
+    basis_set = torch.zeros(V, dtype=torch.int64) - 1
+    basis_set[basis] = torch.arange(len(basis), dtype=torch.int64)
+    col_idx_in_basis = basis_set[cols_f.cpu()]
+    mask = col_idx_in_basis >= 0
+    sel_rows = rows_f.cpu()[mask].to(torch.int64)
+    sel_cols = col_idx_in_basis[mask]
+    sel_vals = vals_f.cpu()[mask].float()
+
+    embeddings = torch.zeros(V, len(basis), dtype=torch.float32)
+    embeddings[sel_rows, sel_cols] = sel_vals
+    embeddings = embeddings.to(device)
+
+    idf = (1.0 / (1.0 + degree.sqrt())).to(device)
+    idf = idf / idf.max().clamp(min=1e-9)
+
+    print(f"    embeddings [{V}×{len(basis)}] (basis) built in {time.time()-t0:.1f}s")
+    return embeddings, idf
+
+
 # ======================================================================
 # 2. Multi-Head Deterministic Attention
 # ======================================================================

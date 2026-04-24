@@ -5,7 +5,7 @@ import numpy as np, torch
 
 from .config import Config
 from .data import load_dataset
-from .model import build_embeddings, build_kn_simple
+from .model import build_embeddings, build_embeddings_basis, build_kn_simple
 from .evaluator import eval_layers, eval_ood
 from .resources import Monitor, detect, setup_cuda_tuning
 from .stats import build_stats
@@ -57,14 +57,22 @@ def run_pipeline(cfg: Config) -> Dict:
     print(f"  stats in {time.time()-t0:.1f}s")
     mon.snapshot("after-stats")
 
-    # Embeddings (SVD on PPMI)
-    print("Building embeddings (SVD on PPMI)...")
+    # Embeddings (SVD or basis from independent dominating set)
+    method = getattr(cfg, "embed_method", "svd")
+    print(f"Building embeddings (method={method})...")
     t0 = time.time()
-    embeddings, idf = build_embeddings(
-        stats.ctx_rows, stats.ctx_cols, stats.ctx_counts,
-        stats.unigram_counts, V, cfg.embed_dim, cfg.min_ppmi,
-        res.primary_device,
-    )
+    if method == "basis":
+        embeddings, idf = build_embeddings_basis(
+            stats.ctx_rows, stats.ctx_cols, stats.ctx_counts,
+            stats.unigram_counts, V, cfg.basis_k, cfg.min_ppmi,
+            res.primary_device,
+        )
+    else:
+        embeddings, idf = build_embeddings(
+            stats.ctx_rows, stats.ctx_cols, stats.ctx_counts,
+            stats.unigram_counts, V, cfg.embed_dim, cfg.min_ppmi,
+            res.primary_device,
+        )
     print(f"  embeddings in {time.time()-t0:.1f}s")
     del stats; gc.collect()
     if torch.cuda.is_available(): torch.cuda.empty_cache()
