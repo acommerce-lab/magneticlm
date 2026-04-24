@@ -75,9 +75,10 @@ def _collect_order_chunked(encoded, order, primes_ng, primes_ctx, device, chunk_
         return None, None, None, None, None, None, None, 0, 0, 0
 
     # Merge across chunks
-    all_keys = torch.cat(reduced_ng_keys).to(device)
-    all_counts = torch.cat(reduced_ng_counts).to(device)
-    all_ctx = torch.cat(reduced_ctx_per_ng).to(device)
+    # Merge on CPU to avoid GPU OOM on large tensors (60M+ at order 4-5)
+    all_keys = torch.cat(reduced_ng_keys)  # already on CPU
+    all_counts = torch.cat(reduced_ng_counts)
+    all_ctx = torch.cat(reduced_ctx_per_ng)
 
     sort_idx = torch.argsort(all_keys)
     all_keys = all_keys[sort_idx]
@@ -85,17 +86,10 @@ def _collect_order_chunked(encoded, order, primes_ng, primes_ctx, device, chunk_
     all_ctx = all_ctx[sort_idx]
 
     uniq_ng, inverse = torch.unique_consecutive(all_keys, return_inverse=True)
-    final_counts = torch.zeros(uniq_ng.numel(), dtype=torch.int64, device=device)
+    final_counts = torch.zeros(uniq_ng.numel(), dtype=torch.int64)
     final_counts.scatter_add_(0, inverse, all_counts)
 
-    # First context per final unique n-gram
-    first_idx = torch.zeros(uniq_ng.numel(), dtype=torch.int64, device=device)
-    first_idx[1:] = torch.cumsum(
-        torch.zeros_like(uniq_ng).scatter_add_(0, inverse, torch.ones_like(inverse))[:-1].cumsum(0)
-        # simpler: just take the first occurrence
-    , dim=0)
-    # Actually just use the first element per group
-    boundaries = torch.ones(all_keys.numel(), dtype=torch.bool, device=device)
+    boundaries = torch.ones(all_keys.numel(), dtype=torch.bool)
     boundaries[1:] = all_keys[1:] != all_keys[:-1]
     first_positions = boundaries.nonzero(as_tuple=True)[0]
     uniq_ctx_per_ng = all_ctx[first_positions]
@@ -104,25 +98,28 @@ def _collect_order_chunked(encoded, order, primes_ng, primes_ctx, device, chunk_
     n2 = int((final_counts == 2).sum().item())
     n3 = int((final_counts == 3).sum().item())
 
-    # Per-context aggregates
+    # Per-context aggregates (CPU)
     ctx_sort = torch.argsort(uniq_ctx_per_ng)
     ctx_s = uniq_ctx_per_ng[ctx_sort]
     counts_s = final_counts[ctx_sort].float()
     uniq_ctx, inv2 = torch.unique_consecutive(ctx_s, return_inverse=True)
     nc = uniq_ctx.numel()
-    totals = torch.zeros(nc, dtype=torch.float32, device=device)
+    totals = torch.zeros(nc, dtype=torch.float32)
     totals.scatter_add_(0, inv2, counts_s)
-    c1 = torch.zeros(nc, dtype=torch.float32, device=device)
+    c1 = torch.zeros(nc, dtype=torch.float32)
     c1.scatter_add_(0, inv2, (counts_s == 1).float())
-    c2 = torch.zeros(nc, dtype=torch.float32, device=device)
+    c2 = torch.zeros(nc, dtype=torch.float32)
     c2.scatter_add_(0, inv2, (counts_s == 2).float())
-    uf = torch.zeros(nc, dtype=torch.float32, device=device)
-    uf.scatter_add_(0, inv2, torch.ones(counts_s.numel(), dtype=torch.float32, device=device))
+    uf = torch.zeros(nc, dtype=torch.float32)
+    uf.scatter_add_(0, inv2, torch.ones(counts_s.numel(), dtype=torch.float32))
 
     del all_keys, all_counts, all_ctx, sort_idx
-    torch.cuda.empty_cache() if device.type == 'cuda' else None
 
-    return uniq_ng, final_counts, uniq_ctx, totals, c1, c2, uf, n1, n2, n3
+    # Move final results to GPU for scoring
+    return (uniq_ng.to(device), final_counts.to(device),
+            uniq_ctx.to(device), totals.to(device),
+            c1.to(device), c2.to(device), uf.to(device),
+            n1, n2, n3)
 
 
 def build(encoded: List[np.ndarray], V: int, max_order: int, device: torch.device) -> Dict:
