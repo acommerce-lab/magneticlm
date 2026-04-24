@@ -95,11 +95,19 @@ def eval_layers(kn, embeddings, idf, encoded, cfg, device):
           (1-lam_c) * kn_dists[i] + lam_c * _decay_boost(h, V, device))
     _eval("Attention only", lambda i, h: attn_dists[i])
 
-    # Combined: KN + cache + attention
-    def _combined(i, h):
+    # Combined (linear): KN + cache + attention
+    def _combined_linear(i, h):
         base = (1-lam_c) * kn_dists[i] + lam_c * _decay_boost(h, V, device)
         return (1-lam_a) * base + lam_a * attn_dists[i]
-    _eval("KN + cache + attention", _combined)
+    _eval("KN + cache + attention", _combined_linear)
+
+    # Combined (gated): attention takes over when confident
+    def _combined_gated(i, h):
+        base = (1-lam_c) * kn_dists[i] + lam_c * _decay_boost(h, V, device)
+        conf = attn_dists[i].max()
+        gate = torch.sigmoid(20.0 * (conf - 0.02))
+        return (1 - gate) * base + gate * attn_dists[i]
+    _eval("KN + cache + gated attention", _combined_gated)
 
     return results
 
@@ -134,7 +142,10 @@ def eval_ood(kn, embeddings, idf, vocab, cfg, device):
 
         rk, t5k = _rank(kn_d, tgt)
         ra, t5a = _rank(attn_d, tgt)
-        combined = (1-lam_a) * ((1-lam_c)*kn_d + lam_c*cache_d) + lam_a * attn_d
+        base = (1-lam_c)*kn_d + lam_c*cache_d
+        conf = attn_d.max()
+        gate = torch.sigmoid(20.0 * (conf - 0.02))
+        combined = (1 - gate) * base + gate * attn_d
         rc, t5c = _rank(combined, tgt)
 
         if rc and rc <= 1: hits[1] += 1
