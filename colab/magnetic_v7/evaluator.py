@@ -93,19 +93,11 @@ def eval_layers(transformer, kn, encoded, cfg, device):
     _eval("KN bigram", lambda i, h: kn_dists[i])
     _eval("KN + cache",
           lambda i, h: (1 - lam_c) * kn_dists[i] + lam_c * _decay_boost(h, V, device))
-    _eval("StatTransformer (attn only)", lambda i, h: tf_dists[i])
-
-    # Combined: linear mix
+    _eval("StatTransformer (pure)", lambda i, h: tf_dists[i])
+    _eval("StatTransformer + cache",
+          lambda i, h: (1 - lam_c) * tf_dists[i] + lam_c * _decay_boost(h, V, device))
     _eval("KN + StatTransformer (50/50)",
           lambda i, h: 0.5 * kn_dists[i] + 0.5 * tf_dists[i])
-
-    # Combined: KN + cache + gated transformer
-    def _gated(i, h):
-        base = (1 - lam_c) * kn_dists[i] + lam_c * _decay_boost(h, V, device)
-        conf = tf_dists[i].max()
-        gate = torch.sigmoid(20.0 * (conf - 0.02))
-        return (1 - gate) * base + gate * tf_dists[i]
-    _eval("KN + cache + gated transformer", _gated)
 
     return results
 

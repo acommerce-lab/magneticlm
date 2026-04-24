@@ -1,16 +1,16 @@
 """v7 — Interpretable Statistical Transformer.
 
-Mimics a standard transformer, all weights from corpus statistics:
+Pure transformer architecture. All weights from corpus statistics.
+Same math as a standard transformer — only the weight source differs.
 
-  1. Embedding: SVD on PPMI → [V, d]
-  2. Q Projection: T_fwd @ E → [V, d]  ("what w predicts next")
-     K Projection: normalized E → [V, d]  ("what w IS")
-  3. Multi-Head Causal Self-Attention (standard scaled dot-product)
-  4. Residual + LayerNorm (no learnable params)
-  5. Multi-layer stacking
-  6. Output: last position @ K.T → softmax
-
-No backpropagation. No gradient descent. Fully interpretable.
+  Q = x @ Wq          where Wq = solve(E.T@E, E.T@T@E)
+  K = x @ Wk          where Wk = I (identity)
+  V = x @ Wv          where Wv = I (identity)
+  scores = Q @ K.T / sqrt(d_head)
+  output = softmax(scores) @ V           ← identical to transformer
+  x = LayerNorm(x + output)              ← identical to transformer
+  FFN(x) = normalize(ReLU(x @ E.T)) @ E ← vocabulary memory lookup
+  x = LayerNorm(x + FFN(x))              ← identical to transformer
 """
 
 import math, time
@@ -59,30 +59,39 @@ def build_embeddings(ctx_rows, ctx_cols, ctx_counts, unigram, V, d, min_ppmi, de
 
 
 # ======================================================================
-# 2. Statistical Q/K Projections
+# 2. Weight Matrices — same role as learned Wq,Wk,Wv in a transformer
 # ======================================================================
 
-def build_projections(embeddings, bg_trans, V, d, device):
-    """Derive Q and K from bigram transitions.
+def build_weight_matrices(embeddings, bg_trans, V, d, device):
+    """Derive Wq, Wk, Wv [d, d] matrices from bigram statistics.
 
-    Q_fwd[w] = T @ E : expected embedding of what follows w.
-    K[w]     = E[w] normalized : what w IS.
+    Wq: "what should follow" projection.
+         In a transformer, Wq is learned. Here we solve:
+           E @ Wq ≈ T @ E   (least squares)
+         So Wq transforms any embedding into "expected successor space."
 
-    This Q/K separation is the key advance over v6.
+    Wk, Wv: identity. In a real transformer these are also learned,
+             but identity preserves the embedding meaning directly.
     """
     t0 = time.time()
 
-    q_fwd = torch.sparse.mm(bg_trans, embeddings)
-    q_fwd = q_fwd / q_fwd.norm(dim=1, keepdim=True).clamp(min=1e-9)
+    TE = torch.sparse.mm(bg_trans, embeddings)  # [V, d]
 
-    k_embed = embeddings / embeddings.norm(dim=1, keepdim=True).clamp(min=1e-9)
+    EtE = embeddings.T @ embeddings  # [d, d]
+    EtTE = embeddings.T @ TE  # [d, d]
 
-    print(f"    Q/K projections [{V}x{d}] in {time.time()-t0:.1f}s")
-    return q_fwd, k_embed
+    reg = 1e-4 * torch.eye(d, device=device)
+    Wq = torch.linalg.solve(EtE + reg, EtTE)  # [d, d]
+
+    Wk = torch.eye(d, device=device)
+    Wv = torch.eye(d, device=device)
+
+    print(f"    Wq,Wk,Wv [{d}x{d}] in {time.time()-t0:.1f}s")
+    return Wq, Wk, Wv
 
 
 # ======================================================================
-# 3. KN scoring (bigram + unigram backoff)
+# 3. KN scoring (kept for comparison only — not part of the transformer)
 # ======================================================================
 
 def build_kn_simple(encoded, V, max_order, device):
@@ -140,7 +149,7 @@ def kn_score(kn, context_ids):
 
 
 # ======================================================================
-# 4. Statistical Transformer
+# 4. Statistical Transformer — same architecture as a real transformer
 # ======================================================================
 
 def _layer_norm(x, eps=1e-5):
@@ -150,26 +159,25 @@ def _layer_norm(x, eps=1e-5):
 
 
 class StatTransformer:
-    """Interpretable Statistical Transformer.
+    """Pure statistical transformer. Same math as a real transformer.
 
-    Architecture:
-      Input tokens → Embed + PosEncode
-      → [Self-Attention(Q,K,V) + Residual + LayerNorm] x n_layers
-      → Output: last_pos @ K_all.T → softmax
+    Each layer:
+      1. Q = x @ Wq,  K = x @ Wk,  V = x @ Wv   ← same as transformer
+      2. attn = softmax(Q @ K.T / sqrt(d_h)) @ V   ← same as transformer
+      3. x = LayerNorm(x + attn)                    ← same as transformer
+      4. ffn = VocabFFN(x)                           ← statistical FFN
+      5. x = LayerNorm(x + ffn)                      ← same as transformer
 
-    Layer 1: Q = Q_fwd[tokens]  (statistical: "what follows this word")
-             K = K_embed[tokens] (statistical: "what this word IS")
-             V = E[tokens]       (raw embeddings)
-
-    Layer 2+: Q = x (refined representation from previous layer)
-              K, V = same as layer 1
+    The ONLY difference from a real transformer: how W matrices are computed.
     """
 
-    def __init__(self, embeddings, q_fwd, k_embed, idf, unigram_prob,
+    def __init__(self, embeddings, Wq, Wk, Wv, idf, unigram_prob,
                  n_heads=4, n_layers=2, context_len=8, pos_decay=0.1):
-        self.embeddings = embeddings
-        self.q_fwd = q_fwd
-        self.k_embed = k_embed
+        self.embeddings = embeddings  # [V, d]
+        self.E_norm = embeddings / embeddings.norm(dim=1, keepdim=True).clamp(min=1e-9)
+        self.Wq = Wq  # [d, d]
+        self.Wk = Wk  # [d, d]
+        self.Wv = Wv  # [d, d]
         self.idf = idf
         self.unigram = unigram_prob
         self.V, self.d = embeddings.shape
@@ -180,7 +188,6 @@ class StatTransformer:
         self.device = embeddings.device
 
     def _self_attention(self, Q, K, V, causal_mask, key_mask):
-        """Standard multi-head scaled dot-product attention."""
         B, S, D = Q.shape
         H = self.n_heads
         d_h = D // H
@@ -197,14 +204,33 @@ class StatTransformer:
         out = torch.matmul(attn_w, Vh)
         return out.transpose(1, 2).contiguous().view(B, S, D)
 
-    def score_batch(self, contexts):
-        """Batched next-token scoring.
+    def _ffn(self, x):
+        """Statistical FFN: vocabulary as memory bank.
 
-        Args:
-            contexts: list of list[int], each a token context window.
-        Returns:
-            [n, V] probability distributions.
+        Like a transformer FFN but W1=E_norm.T, W2=E:
+          h = ReLU(x @ E_norm.T / sqrt(d))   → word activations [V]
+          out = normalize(h) @ E               → weighted sum of embeddings
+
+        Interprets as: "find which words this representation activates,
+        then combine their embeddings as the output."
         """
+        B, S, D = x.shape
+        out = torch.zeros_like(x)
+        max_intermediate = 2_000_000_000 // 4  # 2GB float32 budget
+        chunk = max(1, max_intermediate // (S * self.V))
+        chunk = min(chunk, B)
+
+        for i in range(0, B, chunk):
+            j = min(i + chunk, B)
+            xi = x[i:j]
+            sim = xi @ self.E_norm.T / math.sqrt(self.d)
+            h = F.relu(sim)
+            h_sum = h.sum(dim=-1, keepdim=True).clamp(min=1e-9)
+            h = h / h_sum
+            out[i:j] = h @ self.embeddings
+        return out
+
+    def score_batch(self, contexts):
         n = len(contexts)
         cl = self.context_len
         trimmed = [c[-cl:] for c in contexts]
@@ -219,31 +245,29 @@ class StatTransformer:
 
         S = max_len
 
-        # Embedding + positional decay (recent tokens weighted more)
         x = self.embeddings[padded]
         pos = torch.arange(S, dtype=torch.float32, device=self.device)
         pw = torch.exp(-self.pos_decay * (S - 1 - pos))
         x = x * pw.unsqueeze(0).unsqueeze(-1)
         x = x * pad_mask.unsqueeze(-1).float()
 
-        # Masks for attention
         causal = torch.tril(torch.ones(S, S, device=self.device, dtype=torch.bool))
         key_m = pad_mask.unsqueeze(1).unsqueeze(2)
 
         for layer_idx in range(self.n_layers):
-            if layer_idx == 0:
-                Q = self.q_fwd[padded]
-            else:
-                Q = x
-            K = self.k_embed[padded]
-            V_attn = self.embeddings[padded]
+            Q = x @ self.Wq
+            K = x @ self.Wk
+            V_attn = x @ self.Wv
 
             attn_out = self._self_attention(Q, K, V_attn, causal, key_m)
             x = _layer_norm(x + attn_out)
 
+            ffn_out = self._ffn(x)
+            x = _layer_norm(x + ffn_out)
+
         q_final = x[:, -1, :]
         q_final = q_final / q_final.norm(dim=1, keepdim=True).clamp(min=1e-9)
-        logits = q_final @ self.k_embed.T / math.sqrt(self.d)
+        logits = q_final @ self.E_norm.T / math.sqrt(self.d)
 
         for i, c in enumerate(trimmed):
             for t in c:
@@ -253,5 +277,4 @@ class StatTransformer:
         return F.softmax(logits, dim=1)
 
     def score_single(self, context_ids):
-        """Score a single context. Returns [V] distribution."""
         return self.score_batch([context_ids])[0]

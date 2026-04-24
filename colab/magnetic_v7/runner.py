@@ -5,7 +5,7 @@ import numpy as np, torch
 
 from .config import Config
 from .data import load_dataset
-from .model import build_embeddings, build_projections, build_kn_simple, StatTransformer
+from .model import build_embeddings, build_weight_matrices, build_kn_simple, StatTransformer
 from .evaluator import eval_layers, eval_ood
 from .resources import Monitor, detect, setup_cuda_tuning
 from .stats import build_stats
@@ -81,21 +81,20 @@ def run_pipeline(cfg: Config) -> Dict:
     print(f"  KN in {time.time()-t0:.1f}s")
     mon.snapshot("after-kn")
 
-    # Q/K Projections (from bigram transitions)
-    print("Building Q/K projections (from bigram transitions)...")
+    # Weight matrices Wq, Wk, Wv (from bigram transitions)
+    print("Building Wq, Wk, Wv (from bigram transitions)...")
     t0 = time.time()
-    q_fwd, k_embed = build_projections(
+    Wq, Wk, Wv = build_weight_matrices(
         embeddings, kn["bg_trans"], V, cfg.embed_dim, res.primary_device,
     )
-    print(f"  projections in {time.time()-t0:.1f}s")
-    mon.snapshot("after-proj")
+    print(f"  weight matrices in {time.time()-t0:.1f}s")
+    mon.snapshot("after-weights")
 
     # Build Statistical Transformer
     print(f"Assembling StatTransformer (d={cfg.embed_dim}, heads={cfg.n_heads}, layers={cfg.n_layers})...")
     transformer = StatTransformer(
         embeddings=embeddings,
-        q_fwd=q_fwd,
-        k_embed=k_embed,
+        Wq=Wq, Wk=Wk, Wv=Wv,
         idf=idf,
         unigram_prob=kn["uni_prob"],
         n_heads=cfg.n_heads,
