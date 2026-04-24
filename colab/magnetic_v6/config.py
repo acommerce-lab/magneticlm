@@ -45,6 +45,7 @@ class Config:
 
     # Hardware
     device: str = "auto"
+    multi_gpu: bool = True
     num_workers: int = -1
     mem_log_every: int = 100
     mem_warn_percent: float = 88.0
