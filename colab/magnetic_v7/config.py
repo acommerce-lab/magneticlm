@@ -20,20 +20,17 @@ class Config:
     cost_ceiling: float = 20.0
     max_out_edges: int = 200
 
-    # Embedding
-    embed_dim: int = 128
+    # Spectral Transformer (genetic architecture)
+    spectral_threshold: float = 0.01  # fraction of S_max — THE single control
+    max_d: int = 256                  # upper bound for auto-detected d
     min_ppmi: float = 0.5
-
-    # Statistical Transformer
-    n_heads: int = 4
     n_layers: int = 2
     context_len: int = 8
     pos_decay: float = 0.1
 
-    # Scoring / mixing
+    # Cache
     stat_cache_window: int = 3000
     cache_lambda: float = 0.12
-    kn_max_order: int = 3
 
     # Eval
     eval_ppl: bool = True

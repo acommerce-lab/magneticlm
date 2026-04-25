@@ -1,12 +1,12 @@
-"""v7 Pipeline: stats -> embeddings -> spectral -> transformer -> eval.
-No KN in the main path. Pure transformer evaluation."""
+"""v7 Pipeline: stats -> ONE SVD -> transformer -> eval.
+Genetic architecture: single threshold controls everything."""
 import gc, json, os, time
 from typing import Dict
 import numpy as np, torch
 
 from .config import Config
 from .data import load_dataset
-from .model import build_embeddings, build_spectral_heads, StatTransformer
+from .model import build_all_from_spectrum, StatTransformer
 from .evaluator import eval_layers, eval_ood
 from .resources import Monitor, detect, setup_cuda_tuning
 from .stats import build_stats
@@ -14,7 +14,6 @@ from .tokenizer import build_vocab, encode_stream
 
 
 def _build_bigram_trans(encoded, V, device):
-    """Build bigram transition matrix (sparse). Needed for spectral Wq."""
     bg_r, bg_c = [], []
     for arr in encoded:
         if arr.size < 2:
@@ -45,7 +44,7 @@ def run_pipeline(cfg: Config) -> Dict:
     np.random.seed(cfg.seed)
 
     print("=" * 72)
-    print("MagneticLM v7 — Interpretable Statistical Transformer")
+    print("MagneticLM v7 — Genetic Statistical Transformer")
     print("=" * 72)
 
     setup_cuda_tuning()
@@ -79,69 +78,56 @@ def run_pipeline(cfg: Config) -> Dict:
     print(f"  encoded in {time.time()-t0:.1f}s")
     mon.snapshot("after-encode")
 
-    # Stats (for PPMI → embeddings)
-    print("Building statistics...")
+    # Stats
+    print("Building co-occurrence statistics...")
     t0 = time.time()
     stats = build_stats(enc_train, V, cfg, res.primary_device)
     print(f"  stats in {time.time()-t0:.1f}s")
-    mon.snapshot("after-stats")
 
-    # Embeddings
-    print("Building embeddings (SVD on PPMI)...")
-    t0 = time.time()
-    embeddings, idf = build_embeddings(
-        stats.ctx_rows, stats.ctx_cols, stats.ctx_counts,
-        stats.unigram_counts, V, cfg.embed_dim, cfg.min_ppmi,
-        res.primary_device,
-    )
-    print(f"  embeddings in {time.time()-t0:.1f}s")
-    del stats
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    mon.snapshot("after-embed")
-
-    # Bigram transitions (for spectral Wq only)
     print("Building bigram transitions...")
     t0 = time.time()
     bg_trans = _build_bigram_trans(enc_train, V, res.primary_device)
     cfg.unk_id = vocab.unk_id
     print(f"  bigrams in {time.time()-t0:.1f}s")
-    mon.snapshot("after-bigram")
+    mon.snapshot("after-stats")
 
-    # Spectral decomposition → Wq, Wk, Wv, spectral weights
-    print("Discovering spectral weights (knowledge circles)...")
+    # ONE SVD → everything
+    print(f"Building from spectrum (threshold={cfg.spectral_threshold})...")
     t0 = time.time()
-    Wq, Wk, Wv, spectral_weights = build_spectral_heads(
-        embeddings, bg_trans, V, cfg.embed_dim, cfg.n_heads, res.primary_device,
+    embeddings, Wq, Wk, Wv, spectral_weights, idf, d = build_all_from_spectrum(
+        stats.ctx_rows, stats.ctx_cols, stats.ctx_counts,
+        stats.unigram_counts, bg_trans, V,
+        cfg.spectral_threshold, cfg.min_ppmi, cfg.max_d,
+        res.primary_device,
     )
-    del bg_trans
+    print(f"  spectrum -> d={d} in {time.time()-t0:.1f}s")
+    del stats, bg_trans
     gc.collect()
-    print(f"  spectral in {time.time()-t0:.1f}s")
-    mon.snapshot("after-spectral")
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    mon.snapshot("after-spectrum")
 
-    # Build transformer — distribute across GPUs if available
+    # Build transformer
     devices = [res.primary_device]
     if res.multi_gpu and len(res.gpu_ids) > 1:
         devices = [torch.device(f"cuda:{i}") for i in res.gpu_ids]
 
-    print(f"Assembling StatTransformer (d={cfg.embed_dim}, layers={cfg.n_layers}, devices={len(devices)})...")
+    print(f"Assembling StatTransformer (d={d}, layers={cfg.n_layers}, devices={len(devices)})...")
     transformer = StatTransformer(
         embeddings=embeddings,
         Wq=Wq, Wk=Wk, Wv=Wv,
         spectral_weights=spectral_weights,
         idf=idf,
-        unigram_prob=torch.ones(V, device=res.primary_device) / V,
         n_layers=cfg.n_layers,
         context_len=cfg.context_len,
         pos_decay=cfg.pos_decay,
         devices=devices,
     )
 
-    # Eval — pure transformer only
+    # Eval
     print("Running evaluation...")
     t_eval = time.time()
-    results: Dict = {}
+    results: Dict = {"d": d, "spectral_threshold": cfg.spectral_threshold}
 
     print("  [eval] Layer diagnostics...")
     results["layers"] = eval_layers(transformer, V, enc_valid, cfg, res.primary_device)

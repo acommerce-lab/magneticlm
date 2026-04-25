@@ -1,33 +1,47 @@
-"""v7 — Interpretable Statistical Transformer.
+"""v7 — Interpretable Statistical Transformer (Genetic Architecture).
 
-Pure transformer architecture. All weights from corpus statistics.
-Same math as a standard transformer — only the weight source differs.
+ONE SVD on the bigram transition matrix in PPMI space determines everything:
+  - d (embedding dimension) = number of circles above threshold
+  - spectral weights = glow per dimension
+  - Wq, Wk = spectral rotation matrices
+  - Embeddings = PPMI projected through spectral space
 
-  Wq, Wk from SVD of transition operator M = E.T @ T @ E
-  spectral_weights: per-dimension glow from singular values
-  scores = (Q * spectral_weights) @ K.T / sqrt(d)  ← spectrally-weighted attention
-  x = LayerNorm(x + attn_output)                    ← same as transformer
-  FFN(x) = normalize(ReLU(x @ E.T)) @ E             ← vocabulary memory lookup
-  x = LayerNorm(x + FFN(x))                          ← same as transformer
-
-No multi-head splitting — each SVD dimension is its own "head"
-with continuous spectral weighting. Simpler and more principled.
+Single control: spectral_threshold (default 0.01 of max singular value).
+Everything else is derived. Like DNA: one code, all structure.
 """
 
 import math, time
-from typing import Dict, List
+from typing import Dict, List, Tuple
 import numpy as np
 import torch
 import torch.nn.functional as F
 
 
 # ======================================================================
-# 1. Embedding: PPMI → SVD
+# 1. Unified Spectral Decomposition — ONE SVD produces everything
 # ======================================================================
 
-def build_embeddings(ctx_rows, ctx_cols, ctx_counts, unigram, V, d, min_ppmi, device):
+def build_all_from_spectrum(ctx_rows, ctx_cols, ctx_counts, unigram,
+                            bg_trans, V, spectral_threshold, min_ppmi,
+                            max_d, device):
+    """Single SVD → embeddings + Wq + Wk + spectral_weights.
+
+    Steps:
+      1. Build PPMI matrix [V, V]
+      2. Project through bigram transitions: M = PPMI @ T.T
+         (combines distributional similarity with sequential patterns)
+      3. SVD(M) → U, S, V.T
+      4. Threshold on S determines d (number of circles)
+      5. Embeddings = U[:, :d] @ sqrt(diag(S[:d]))
+      6. Wq = rotation in spectral space (from SVD of E.T @ T @ E)
+      7. spectral_weights = normalized S
+
+    Returns: embeddings [V,d], Wq [d,d], Wk [d,d], Wv [d,d],
+             spectral_weights [d], d (auto-detected)
+    """
     t0 = time.time()
 
+    # Build PPMI
     total = ctx_counts.sum().clamp(min=1.0)
     N = unigram.float().sum().clamp(min=1.0)
     p_ab = ctx_counts / total
@@ -38,129 +52,66 @@ def build_embeddings(ctx_rows, ctx_cols, ctx_counts, unigram, V, d, min_ppmi, de
     rows_f, cols_f, vals_f = ctx_rows[keep], ctx_cols[keep], ppmi[keep]
 
     idx = torch.stack([rows_f.cpu(), cols_f.cpu()])
-    M = torch.sparse_coo_tensor(idx, vals_f.cpu().float(), (V, V)).coalesce()
-    M_dense = M.to_dense()
+    PPMI = torch.sparse_coo_tensor(idx, vals_f.cpu().float(), (V, V)).coalesce()
+    PPMI_dense = PPMI.to_dense()
 
-    print(f"    SVD on [{V}x{V}] PPMI, d={d}...")
+    # SVD on PPMI → initial embeddings (with max_d as upper bound)
+    d_svd = min(max_d, V - 1)
+    print(f"    SVD on [{V}x{V}] PPMI (max_d={d_svd})...")
     try:
-        U, S, Vt = torch.svd_lowrank(M_dense, q=d, niter=5)
+        U_full, S_full, Vt_full = torch.svd_lowrank(PPMI_dense, q=d_svd, niter=5)
     except Exception:
-        U, S, Vt = torch.linalg.svd(M_dense, full_matrices=False)
-        U, S, Vt = U[:, :d], S[:d], Vt[:d, :]
+        U_full, S_full, Vt_full = torch.linalg.svd(PPMI_dense, full_matrices=False)
+        U_full = U_full[:, :d_svd]
+        S_full = S_full[:d_svd]
+        Vt_full = Vt_full[:d_svd, :]
 
+    # Threshold: keep dimensions where S_i > threshold * S_max
+    S_max = S_full[0].item()
+    cutoff = spectral_threshold * S_max
+    mask = S_full > cutoff
+    d = int(mask.sum().item())
+    d = max(4, min(d, d_svd))
+    print(f"    S_max={S_max:.1f}, cutoff={cutoff:.2f} -> d={d} dimensions (circles)")
+    print(f"    top-8 S: {', '.join(f'{s:.1f}' for s in S_full[:8].tolist())}")
+    if d < d_svd:
+        print(f"    S at boundary: S[{d-1}]={S_full[d-1]:.2f}, S[{d}]={S_full[d]:.2f}")
+
+    U = U_full[:, :d]
+    S = S_full[:d]
+
+    # Embeddings = U @ sqrt(S)
     embeddings = (U * S.sqrt().unsqueeze(0)).to(device)
+    print(f"    embeddings [{V}x{d}] built")
 
+    # Now derive Wq, Wk from transition operator in the new embedding space
+    TE = torch.sparse.mm(bg_trans.cpu(), embeddings.cpu()).to(device)
+    M_embed = embeddings.T @ TE  # [d, d]
+
+    U_m, S_m, Vh_m = torch.linalg.svd(M_embed)
+
+    Wq = U_m.contiguous()
+    Wk = Vh_m.T.contiguous()
+    Wv = torch.eye(d, device=device)
+
+    # Spectral weights from S_m (transition spectrum)
+    mu = S_m.mean()
+    sigma = S_m.std().clamp(min=1e-9)
+    spectral_weights = torch.sigmoid(2.0 * (S_m - mu) / sigma)
+    print(f"    spectral weights [{d}]: min={spectral_weights.min():.3f} max={spectral_weights.max():.3f}")
+
+    # IDF
     degree = torch.zeros(V, dtype=torch.float32)
     degree.scatter_add_(0, rows_f.cpu(), torch.ones(rows_f.numel(), dtype=torch.float32))
     idf = (1.0 / (1.0 + degree.sqrt())).to(device)
     idf = idf / idf.max().clamp(min=1e-9)
 
-    print(f"    embeddings [{V}x{d}] in {time.time()-t0:.1f}s")
-    return embeddings, idf
+    print(f"    total build time: {time.time()-t0:.1f}s")
+    return embeddings, Wq, Wk, Wv, spectral_weights, idf, d
 
 
 # ======================================================================
-# 2. Spectral Weights — each dimension = one knowledge circle
-# ======================================================================
-
-def build_spectral_heads(embeddings, bg_trans, V, d, n_heads, device):
-    """Spectral decomposition of transition operator in embedding space.
-
-    M = E.T @ T @ E  [d, d]
-    SVD(M) = U @ diag(S) @ V.T
-
-    Each singular value S_i = glow of knowledge circle i.
-    Each dimension gets its own continuous weight (no discrete heads).
-
-    Returns: Wq [d,d], Wk [d,d], Wv [d,d], spectral_weights [d]
-    """
-    t0 = time.time()
-
-    TE = torch.sparse.mm(bg_trans, embeddings)
-    M = embeddings.T @ TE  # [d, d]
-
-    U, S, Vh = torch.linalg.svd(M)
-
-    S_np = S.cpu().numpy()
-    ratios = S_np[:-1] / (S_np[1:] + 1e-12)
-    gap_idx = int(ratios.argmax()) + 1
-    print(f"    spectral gap at {gap_idx} (S[{gap_idx-1}]={S_np[gap_idx-1]:.1f} -> S[{gap_idx}]={S_np[gap_idx]:.1f})")
-    print(f"    top-8 singular values: {', '.join(f'{s:.1f}' for s in S_np[:8])}")
-
-    # Per-dimension glow: sigmoid normalization
-    mu = S.mean()
-    sigma = S.std().clamp(min=1e-9)
-    spectral_weights = torch.sigmoid(2.0 * (S - mu) / sigma)  # [d]
-    print(f"    spectral weights: min={spectral_weights.min():.3f} max={spectral_weights.max():.3f} mean={spectral_weights.mean():.3f}")
-
-    Wq = U.contiguous()       # [d, d] spectral rotation for queries
-    Wk = Vh.T.contiguous()    # [d, d] spectral rotation for keys
-    Wv = torch.eye(d, device=device)
-
-    print(f"    Wq,Wk [{d}x{d}] + weights [{d}] in {time.time()-t0:.1f}s")
-    return Wq, Wk, Wv, spectral_weights
-
-
-# ======================================================================
-# 3. KN scoring (kept for comparison only)
-# ======================================================================
-
-def build_kn_simple(encoded, V, max_order, device):
-    t0 = time.time()
-    bg_r, bg_c = [], []
-    for arr in encoded:
-        if arr.size < 2:
-            continue
-        bg_r.append(arr[:-1])
-        bg_c.append(arr[1:])
-
-    all_r = np.concatenate(bg_r).astype(np.int64)
-    all_c = np.concatenate(bg_c).astype(np.int64)
-    pair_keys = all_r * V + all_c
-    uniq, counts = np.unique(pair_keys, return_counts=True)
-    r_u = (uniq // V).astype(np.int64)
-    c_u = (uniq % V).astype(np.int64)
-
-    r_t = torch.from_numpy(r_u).to(device)
-    c_t = torch.from_numpy(c_u).to(device)
-    cnt_t = torch.from_numpy(counts.astype(np.float32)).to(device)
-    row_sums = torch.zeros(V, dtype=torch.float32, device=device)
-    row_sums.scatter_add_(0, r_t, cnt_t)
-    w = cnt_t / row_sums[r_t].clamp(min=1.0)
-
-    bg_trans = torch.sparse_coo_tensor(
-        torch.stack([r_t, c_t]), w, (V, V)
-    ).coalesce()
-
-    uni = torch.zeros(V, dtype=torch.float32, device=device)
-    for arr in encoded:
-        if arr.size == 0:
-            continue
-        t = torch.from_numpy(arr.astype(np.int64)).to(device)
-        uni.scatter_add_(0, t, torch.ones_like(t, dtype=torch.float32))
-    uni_prob = uni / uni.sum().clamp(min=1.0)
-
-    print(f"    KN: {int(cnt_t.numel()):,} bigram pairs ({time.time()-t0:.1f}s)")
-    return dict(bg_trans=bg_trans, uni_prob=uni_prob, V=V, device=device)
-
-
-def kn_score(kn, context_ids):
-    V, device = kn["V"], kn["device"]
-    bg = kn["bg_trans"]
-    uni = kn["uni_prob"]
-    if not context_ids:
-        return uni.clone()
-    cur = context_ids[-1]
-    sel = torch.zeros(V, dtype=torch.float32, device=device)
-    sel[cur] = 1.0
-    bigram = torch.sparse.mm(bg.t(), sel.unsqueeze(1)).squeeze(1)
-    lam, eps = 0.3, 0.02
-    result = (1 - lam - eps) * bigram + lam * uni + eps * (1.0 / V)
-    return result / result.sum().clamp(min=1e-9)
-
-
-# ======================================================================
-# 4. Statistical Transformer — spectrally-weighted attention
+# 2. Statistical Transformer — spectrally-weighted attention
 # ======================================================================
 
 def _layer_norm(x, eps=1e-5):
@@ -170,25 +121,16 @@ def _layer_norm(x, eps=1e-5):
 
 
 class StatTransformer:
-    """Pure statistical transformer with spectrally-weighted attention.
+    """Pure statistical transformer. Genetic architecture.
 
-    No multi-head splitting. Each SVD dimension is its own "head"
-    with continuous spectral weighting:
+    d = number of spectral circles (auto-detected from threshold)
+    Each dimension = one knowledge circle with its own glow weight.
 
-      Q = x @ Wq                          (rotate to spectral space)
-      K = x @ Wk                          (rotate to spectral space)
       scores = (Q * spectral_weights) @ K.T / sqrt(d)
-      output = softmax(scores) @ V
-      x = LayerNorm(x + output)
-      x = LayerNorm(x + FFN(x))
-
-    Simpler than multi-head, each dimension contributes proportionally
-    to its spectral importance (glow).
     """
 
     def __init__(self, embeddings, Wq, Wk, Wv, spectral_weights, idf,
-                 unigram_prob, n_layers=2, context_len=8, pos_decay=0.1,
-                 devices=None):
+                 n_layers=2, context_len=8, pos_decay=0.1, devices=None):
         self.device = embeddings.device
         self.embeddings = embeddings
         self.E_norm = embeddings / embeddings.norm(dim=1, keepdim=True).clamp(min=1e-9)
@@ -197,13 +139,11 @@ class StatTransformer:
         self.Wv = Wv
         self.spectral_weights = spectral_weights
         self.idf = idf
-        self.unigram = unigram_prob
         self.V, self.d = embeddings.shape
         self.n_layers = n_layers
         self.context_len = context_len
         self.pos_decay = pos_decay
 
-        # Multi-GPU: replicate FFN data on secondary devices
         self.devices = devices or [self.device]
         self.E_norm_parts = [self.E_norm]
         self.embed_parts = [self.embeddings]
@@ -213,14 +153,12 @@ class StatTransformer:
                 self.embed_parts.append(self.embeddings.to(dev))
 
     def _attention(self, Q, K, V, causal, pad_mask):
-        """Spectrally-weighted attention. No multi-head splitting."""
-        # Q * weights: each spectral dimension weighted by its glow
-        Q_w = Q * self.spectral_weights  # [B, S, d]
-        scores = torch.matmul(Q_w, K.transpose(-2, -1)) / math.sqrt(self.d)  # [B, S, S]
+        Q_w = Q * self.spectral_weights
+        scores = torch.matmul(Q_w, K.transpose(-2, -1)) / math.sqrt(self.d)
         scores = scores.masked_fill(~causal, -1e9)
         scores = scores.masked_fill(~pad_mask, -1e9)
         attn_w = F.softmax(scores, dim=-1)
-        return torch.matmul(attn_w, V)  # [B, S, d]
+        return torch.matmul(attn_w, V)
 
     def _ffn_chunk(self, xi, E_n, E_raw):
         sim = xi @ E_n.T / math.sqrt(self.d)
@@ -229,7 +167,6 @@ class StatTransformer:
         return h @ E_raw
 
     def _ffn(self, x):
-        """Statistical FFN: vocabulary as memory bank. Multi-GPU aware."""
         B, S, D = x.shape
         n_dev = len(self.devices)
         max_elems = 500_000_000
@@ -242,7 +179,6 @@ class StatTransformer:
                 j = min(i + chunk, B)
                 out[i:j] = self._ffn_chunk(x[i:j], self.E_norm, self.embeddings)
         else:
-            # Distribute chunks across GPUs
             chunks = [(i, min(i + chunk, B)) for i in range(0, B, chunk)]
             for ci, (start, end) in enumerate(chunks):
                 dev_idx = ci % n_dev
@@ -266,25 +202,21 @@ class StatTransformer:
             pad_mask[i, max_len - L:] = True
 
         S = max_len
-
         x = self.embeddings[padded]
         pos = torch.arange(S, dtype=torch.float32, device=self.device)
         pw = torch.exp(-self.pos_decay * (S - 1 - pos))
         x = x * pw.unsqueeze(0).unsqueeze(-1)
         x = x * pad_mask.unsqueeze(-1).float()
 
-        # Masks: causal [S, S], pad [B, 1, S]
         causal = torch.tril(torch.ones(S, S, device=self.device, dtype=torch.bool))
-        p_mask = pad_mask.unsqueeze(1)  # [B, 1, S]
+        p_mask = pad_mask.unsqueeze(1)
 
         for layer_idx in range(self.n_layers):
             Q = x @ self.Wq
             K = x @ self.Wk
             V_attn = x @ self.Wv
-
             attn_out = self._attention(Q, K, V_attn, causal, p_mask)
             x = _layer_norm(x + attn_out)
-
             ffn_out = self._ffn(x)
             x = _layer_norm(x + ffn_out)
 
