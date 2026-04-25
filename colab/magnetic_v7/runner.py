@@ -5,7 +5,7 @@ import numpy as np, torch
 
 from .config import Config
 from .data import load_dataset
-from .model import build_embeddings, build_weight_matrices, build_kn_simple, StatTransformer
+from .model import build_embeddings, build_spectral_heads, build_kn_simple, StatTransformer
 from .evaluator import eval_layers, eval_ood
 from .resources import Monitor, detect, setup_cuda_tuning
 from .stats import build_stats
@@ -81,14 +81,14 @@ def run_pipeline(cfg: Config) -> Dict:
     print(f"  KN in {time.time()-t0:.1f}s")
     mon.snapshot("after-kn")
 
-    # Weight matrices Wq, Wk, Wv (from bigram transitions)
-    print("Building Wq, Wk, Wv (from bigram transitions)...")
+    # Spectral head discovery → Wq, Wk, Wv
+    print("Discovering spectral heads (knowledge circles)...")
     t0 = time.time()
-    Wq, Wk, Wv = build_weight_matrices(
-        embeddings, kn["bg_trans"], V, cfg.embed_dim, res.primary_device,
+    Wq, Wk, Wv, head_glow = build_spectral_heads(
+        embeddings, kn["bg_trans"], V, cfg.embed_dim, cfg.n_heads, res.primary_device,
     )
-    print(f"  weight matrices in {time.time()-t0:.1f}s")
-    mon.snapshot("after-weights")
+    print(f"  spectral heads in {time.time()-t0:.1f}s")
+    mon.snapshot("after-spectral")
 
     # Build Statistical Transformer
     print(f"Assembling StatTransformer (d={cfg.embed_dim}, heads={cfg.n_heads}, layers={cfg.n_layers})...")

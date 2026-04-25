@@ -59,35 +59,77 @@ def build_embeddings(ctx_rows, ctx_cols, ctx_counts, unigram, V, d, min_ppmi, de
 
 
 # ======================================================================
-# 2. Weight Matrices — same role as learned Wq,Wk,Wv in a transformer
+# 2. Spectral Head Discovery — Wq from SVD of bigram transition matrix
 # ======================================================================
 
-def build_weight_matrices(embeddings, bg_trans, V, d, device):
-    """Derive Wq, Wk, Wv [d, d] matrices from bigram statistics.
+def build_spectral_heads(embeddings, bg_trans, V, d, n_heads, device):
+    """Derive Wq via spectral decomposition of bigram transitions.
 
-    Wq: "what should follow" projection.
-         In a transformer, Wq is learned. Here we solve:
-           E @ Wq ≈ T @ E   (least squares)
-         So Wq transforms any embedding into "expected successor space."
+    Instead of arbitrary head count, we analyze the transition matrix T
+    in embedding space to discover natural "knowledge circles":
 
-    Wk, Wv: identity. In a real transformer these are also learned,
-             but identity preserves the embedding meaning directly.
+      M = E.T @ T @ E   →  [d, d] transition operator in embedding space
+      SVD(M) = U @ S @ V.T
+
+    Each singular triplet (u_i, s_i, v_i) is a knowledge circle:
+      - u_i: the "query direction" (what this circle asks for)
+      - s_i: the "glow" (how strong this circle is)
+      - v_i: the "key direction" (what this circle represents)
+
+    The spectral gap in S tells us how many circles are meaningful.
+    We take the top n_heads and weight them by normalized glow.
+
+    Wq = U[:, :n_heads*d_h] @ diag(scale)   — spectral query projection
+    Wk = V[:, :n_heads*d_h]                  — spectral key projection
+    Wv = identity                             — values are raw embeddings
+
+    Returns: Wq [d, d], Wk [d, d], Wv [d, d], head_glow [n_heads]
     """
     t0 = time.time()
 
+    # Build transition operator in embedding space: M = E.T @ T @ E
     TE = torch.sparse.mm(bg_trans, embeddings)  # [V, d]
+    M = embeddings.T @ TE  # [d, d]
 
-    EtE = embeddings.T @ embeddings  # [d, d]
-    EtTE = embeddings.T @ TE  # [d, d]
+    # SVD of M → spectral circles
+    U, S, Vh = torch.linalg.svd(M)
+    # U: [d, d], S: [d], Vh: [d, d]
 
-    reg = 1e-4 * torch.eye(d, device=device)
-    Wq = torch.linalg.solve(EtE + reg, EtTE)  # [d, d]
+    # Spectral gap analysis
+    S_np = S.cpu().numpy()
+    ratios = S_np[:-1] / (S_np[1:] + 1e-12)
+    gap_idx = int(ratios.argmax()) + 1
+    print(f"    spectral gap at {gap_idx} (S[{gap_idx-1}]={S_np[gap_idx-1]:.1f} → S[{gap_idx}]={S_np[gap_idx]:.1f})")
+    print(f"    top-8 singular values: {', '.join(f'{s:.1f}' for s in S_np[:8])}")
+    print(f"    using n_heads={n_heads} (natural gap suggests {gap_idx})")
 
-    Wk = torch.eye(d, device=device)
+    d_h = d // n_heads
+
+    # Glow normalization: dampen overly bright circles, boost dim ones
+    raw_glow = S[:n_heads * d_h]  # one glow per sub-dimension
+    # Group by head: average glow per head
+    head_glow = raw_glow.view(n_heads, d_h).mean(dim=1)  # [n_heads]
+    mu = head_glow.mean()
+    sigma = head_glow.std().clamp(min=1e-9)
+    # Sigmoid normalization: compress dynamic range
+    head_scale = torch.sigmoid(2.0 * (head_glow - mu) / sigma)  # [n_heads]
+    print(f"    head glow: {', '.join(f'{g:.2f}' for g in head_glow.tolist())}")
+    print(f"    head scale: {', '.join(f'{s:.3f}' for s in head_scale.tolist())}")
+
+    # Build per-dimension scale: expand head_scale to all d_h dims per head
+    dim_scale = head_scale.repeat_interleave(d_h)  # [d]
+
+    # Wq = U[:, :d] @ diag(dim_scale) — spectral query with glow weighting
+    Wq = U[:, :d] * dim_scale.unsqueeze(0)  # [d, d]
+
+    # Wk = V.T[:d, :] transposed = V[:, :d] — spectral key directions
+    Wk = Vh.T[:, :d].contiguous()  # [d, d]
+
+    # Wv = identity
     Wv = torch.eye(d, device=device)
 
-    print(f"    Wq,Wk,Wv [{d}x{d}] in {time.time()-t0:.1f}s")
-    return Wq, Wk, Wv
+    print(f"    spectral Wq,Wk,Wv [{d}x{d}] in {time.time()-t0:.1f}s")
+    return Wq, Wk, Wv, head_glow
 
 
 # ======================================================================
