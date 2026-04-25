@@ -176,7 +176,7 @@ def run_pipeline(cfg: Config) -> Dict:
     print(f"Assembling Triangle Transformer (d={d}, L={n_layers})...")
     transformer = StatTransformer(
         embeddings=embeddings,
-        Wq=Wq, Wk=Wk,
+        Wq_base=Wq, Wk_base=Wk,
         S_raw=S_raw,
         idf=idf,
         n_layers=n_layers,
