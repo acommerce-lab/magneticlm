@@ -21,7 +21,7 @@ class Config:
     max_out_edges: int = 200
 
     # Transformer
-    var_target: float = 0.5    # cumulative variance to retain (0.5=50%, the structural core)
+    var_target: float = 0.3    # cumulative variance to retain (0.3=30% structural core)
     min_ppmi: float = 0.5
     context_len: int = 8
     pos_decay: float = 0.1

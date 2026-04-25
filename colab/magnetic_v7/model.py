@@ -63,14 +63,26 @@ def build_all_from_spectrum(ctx_rows, ctx_cols, ctx_counts, unigram,
         print(f"    randomized SVD on [{V}x{V}] PPMI, q={q}...")
         U_full, S_full, Vt_full = torch.svd_lowrank(PPMI_dense, q=q, niter=5)
 
-    # Cumulative variance threshold: keep dims explaining 90% of energy
-    S_sq = S_full ** 2
-    cumvar = torch.cumsum(S_sq, dim=0) / S_sq.sum().clamp(min=1e-9)
-    # var_target passed as parameter
-    d = int((cumvar < var_target).sum().item()) + 1
-    d = max(4, min(d, len(S_full)))
-    actual_var = cumvar[d - 1].item()
-    print(f"    cumulative variance: {actual_var:.1%} at d={d} (target={var_target:.0%})")
+    # Auto-detect d via elbow method (maximum curvature of log-spectrum)
+    if var_target > 0:
+        # Manual: cumulative variance threshold
+        S_sq = S_full ** 2
+        cumvar = torch.cumsum(S_sq, dim=0) / S_sq.sum().clamp(min=1e-9)
+        d = int((cumvar < var_target).sum().item()) + 1
+        d = max(4, min(d, len(S_full)))
+        print(f"    cumulative variance: {cumvar[d-1]:.1%} at d={d} (target={var_target:.0%})")
+    else:
+        # Auto: elbow method — find maximum curvature in log-spectrum
+        log_S = torch.log(S_full.clamp(min=1e-10))
+        if len(log_S) > 4:
+            d2 = log_S[:-2] - 2 * log_S[1:-1] + log_S[2:]
+            d = int(d2.argmax().item()) + 2
+            d = max(4, min(d, len(S_full)))
+        else:
+            d = len(S_full)
+        S_sq = S_full ** 2
+        cumvar = torch.cumsum(S_sq, dim=0) / S_sq.sum().clamp(min=1e-9)
+        print(f"    elbow at d={d} (explains {cumvar[d-1]:.1%} variance)")
     print(f"    top-8 S: {', '.join(f'{s:.1f}' for s in S_full[:8].tolist())}")
     if d < len(S_full):
         print(f"    boundary: S[{d-1}]={S_full[d-1]:.2f}, S[{d}]={S_full[d]:.2f}")
