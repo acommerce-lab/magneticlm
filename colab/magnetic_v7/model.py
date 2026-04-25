@@ -48,13 +48,14 @@ def build_all_from_spectrum(ctx_rows, ctx_cols, ctx_counts, unigram,
     PPMI = torch.sparse_coo_tensor(idx, vals_f.cpu().float(), (V, V)).coalesce()
     PPMI_dense = PPMI.to_dense()
 
-    # Full SVD — no artificial cap. Threshold decides d.
-    d_max = V - 1
-    print(f"    SVD on [{V}x{V}] PPMI (free range)...")
-    try:
+    # Adaptive SVD: use randomized for large V, full for small V
+    if V <= 5000:
+        print(f"    full SVD on [{V}x{V}] PPMI...")
         U_full, S_full, Vt_full = torch.linalg.svd(PPMI_dense, full_matrices=False)
-    except Exception:
-        U_full, S_full, Vt_full = torch.svd_lowrank(PPMI_dense, q=min(d_max, 2048), niter=5)
+    else:
+        q = min(V - 1, 4096)
+        print(f"    randomized SVD on [{V}x{V}] PPMI, q={q}...")
+        U_full, S_full, Vt_full = torch.svd_lowrank(PPMI_dense, q=q, niter=5)
 
     # Threshold: keep dimensions where S_i > threshold * S_max
     S_max = S_full[0].item()
@@ -62,8 +63,11 @@ def build_all_from_spectrum(ctx_rows, ctx_cols, ctx_counts, unigram,
     mask = S_full > cutoff
     d = int(mask.sum().item())
     d = max(4, d)
-    print(f"    S_max={S_max:.1f}, cutoff={cutoff:.2f} -> d={d} dimensions (circles)")
+    n_computed = len(S_full)
+    print(f"    S_max={S_max:.1f}, cutoff={cutoff:.2f} -> d={d}/{n_computed} dimensions")
     print(f"    top-8 S: {', '.join(f'{s:.1f}' for s in S_full[:8].tolist())}")
+    if d == n_computed and V > 5000:
+        print(f"    NOTE: all {n_computed} components above cutoff — raise threshold for fewer circles")
     if d < len(S_full):
         print(f"    S at boundary: S[{d-1}]={S_full[d-1]:.2f}, S[{d}]={S_full[d]:.2f}")
 
