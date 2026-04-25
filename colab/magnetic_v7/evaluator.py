@@ -1,11 +1,10 @@
-"""v7 Evaluation — Statistical Transformer channels."""
+"""v7 Evaluation — Pure transformer channels only."""
 
 import math, time
 from typing import Dict, List
 import numpy as np
 import torch
 
-from .model import kn_score
 
 OOD_CLOZE = [
     ("the king ruled the", "kingdom"),
@@ -36,13 +35,12 @@ def _decay_boost(history, V, device):
     return b / s if s > 1e-9 else b
 
 
-def eval_layers(transformer, kn, encoded, cfg, device):
+def eval_layers(transformer, V, encoded, cfg, device):
     arrs = [a for a in encoded if a.size > 1]
     if not arrs:
         return {}
     flat = np.concatenate(arrs).astype(np.int64)
     n_eval = min(len(flat) - 1, cfg.eval_max_tokens)
-    V = kn["V"]
     lam_c = cfg.cache_lambda
     unk_id = getattr(cfg, "unk_id", -1)
     results = {}
@@ -51,13 +49,6 @@ def eval_layers(transformer, kn, encoded, cfg, device):
     targets = [int(flat[i + 1]) for i in range(n_eval)]
     currents = [int(flat[i]) for i in range(n_eval)]
 
-    # Pre-compute KN
-    print("    pre-computing KN...")
-    t0 = time.time()
-    kn_dists = [kn_score(kn, ctx) for ctx in contexts]
-    print(f"    KN done in {time.time()-t0:.1f}s")
-
-    # Pre-compute StatTransformer (batched)
     print("    pre-computing StatTransformer (batch)...")
     t0 = time.time()
     tf_dists = transformer.score_batch(contexts)
@@ -87,24 +78,16 @@ def eval_layers(transformer, kn, encoded, cfg, device):
         ppl = math.exp(nll / max(n, 1))
         r = {"ppl": ppl, "hit@1": h1 / max(n, 1), "hit@5": h5 / max(n, 1)}
         results[name] = r
-        print(f"    [{name:35s}] PPL={ppl:.2f}  h@1={r['hit@1']:.4f}  h@5={r['hit@5']:.4f}  ({time.time()-t_s:.1f}s)")
+        print(f"    [{name:30s}] PPL={ppl:.2f}  h@1={r['hit@1']:.4f}  h@5={r['hit@5']:.4f}  ({time.time()-t_s:.1f}s)")
 
-    # Individual channels
-    _eval("KN bigram", lambda i, h: kn_dists[i])
-    _eval("KN + cache",
-          lambda i, h: (1 - lam_c) * kn_dists[i] + lam_c * _decay_boost(h, V, device))
-    _eval("StatTransformer (pure)", lambda i, h: tf_dists[i])
+    _eval("StatTransformer", lambda i, h: tf_dists[i])
     _eval("StatTransformer + cache",
           lambda i, h: (1 - lam_c) * tf_dists[i] + lam_c * _decay_boost(h, V, device))
-    _eval("KN + StatTransformer (50/50)",
-          lambda i, h: 0.5 * kn_dists[i] + 0.5 * tf_dists[i])
 
     return results
 
 
-def eval_ood(transformer, kn, vocab, cfg, device):
-    V = kn["V"]
-    lam_c = cfg.cache_lambda
+def eval_ood(transformer, V, vocab, cfg, device):
     hits = {1: 0, 5: 0, 10: 0}
     total = 0
     details = []
@@ -121,9 +104,7 @@ def eval_ood(transformer, kn, vocab, cfg, device):
             details.append({"context": context, "answer": answer, "skipped": True})
             continue
 
-        kn_d = kn_score(kn, toks)
         tf_d = transformer.score_single(toks)
-        cache_d = _decay_boost(toks, V, device)
 
         def _rank(d, t):
             d = d.clone()
@@ -133,27 +114,19 @@ def eval_ood(transformer, kn, vocab, cfg, device):
             top = idx.tolist()
             return top.index(t) + 1 if t in top else None, [vocab.itos[i] for i in top[:5]]
 
-        rk, t5k = _rank(kn_d, tgt)
         rt, t5t = _rank(tf_d, tgt)
 
-        base = (1 - lam_c) * kn_d + lam_c * cache_d
-        conf = tf_d.max()
-        gate = torch.sigmoid(20.0 * (conf - 0.02))
-        combined = (1 - gate) * base + gate * tf_d
-        rc, t5c = _rank(combined, tgt)
-
-        if rc and rc <= 1:
+        if rt and rt <= 1:
             hits[1] += 1
-        if rc and rc <= 5:
+        if rt and rt <= 5:
             hits[5] += 1
-        if rc and rc <= 10:
+        if rt and rt <= 10:
             hits[10] += 1
         total += 1
         details.append({
             "context": context, "answer": answer,
-            "kn": rk or ">50", "tf": rt or ">50", "mix": rc or ">50",
-            "gate": f"{float(gate):.3f}",
-            "tf_top5": t5t,
+            "rank": rt or ">50",
+            "top5": t5t,
         })
 
     recall = {f"ood_hit@{k}": hits[k] / max(total, 1) for k in [1, 5, 10]}
@@ -165,7 +138,7 @@ def eval_ood(transformer, kn, vocab, cfg, device):
         if d.get("skipped"):
             print(f"      [{d['context']!r}] -> SKIPPED")
             continue
-        t5 = " ".join(d.get("tf_top5", []))
-        print(f"      [{d['context']!r}] -> '{d['answer']}' KN={d['kn']} TF={d['tf']} MIX={d['mix']} gate={d['gate']}  tf5=[{t5}]")
+        t5 = " ".join(d.get("top5", []))
+        print(f"      [{d['context']!r}] -> '{d['answer']}' rank={d['rank']}  top5=[{t5}]")
     recall["details"] = details
     return recall

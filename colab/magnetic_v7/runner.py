@@ -1,15 +1,43 @@
-"""v7 Pipeline: stats -> embeddings -> projections -> KN -> transformer -> eval."""
+"""v7 Pipeline: stats -> embeddings -> spectral -> transformer -> eval.
+No KN in the main path. Pure transformer evaluation."""
 import gc, json, os, time
 from typing import Dict
 import numpy as np, torch
 
 from .config import Config
 from .data import load_dataset
-from .model import build_embeddings, build_spectral_heads, build_kn_simple, StatTransformer
+from .model import build_embeddings, build_spectral_heads, StatTransformer
 from .evaluator import eval_layers, eval_ood
 from .resources import Monitor, detect, setup_cuda_tuning
 from .stats import build_stats
 from .tokenizer import build_vocab, encode_stream
+
+
+def _build_bigram_trans(encoded, V, device):
+    """Build bigram transition matrix (sparse). Needed for spectral Wq."""
+    bg_r, bg_c = [], []
+    for arr in encoded:
+        if arr.size < 2:
+            continue
+        bg_r.append(arr[:-1])
+        bg_c.append(arr[1:])
+    all_r = np.concatenate(bg_r).astype(np.int64)
+    all_c = np.concatenate(bg_c).astype(np.int64)
+    pair_keys = all_r * V + all_c
+    uniq, counts = np.unique(pair_keys, return_counts=True)
+    r_u = (uniq // V).astype(np.int64)
+    c_u = (uniq % V).astype(np.int64)
+    r_t = torch.from_numpy(r_u).to(device)
+    c_t = torch.from_numpy(c_u).to(device)
+    cnt_t = torch.from_numpy(counts.astype(np.float32)).to(device)
+    row_sums = torch.zeros(V, dtype=torch.float32, device=device)
+    row_sums.scatter_add_(0, r_t, cnt_t)
+    w = cnt_t / row_sums[r_t].clamp(min=1.0)
+    bg_trans = torch.sparse_coo_tensor(
+        torch.stack([r_t, c_t]), w, (V, V)
+    ).coalesce()
+    print(f"    {int(cnt_t.numel()):,} bigram pairs")
+    return bg_trans
 
 
 def run_pipeline(cfg: Config) -> Dict:
@@ -51,7 +79,7 @@ def run_pipeline(cfg: Config) -> Dict:
     print(f"  encoded in {time.time()-t0:.1f}s")
     mon.snapshot("after-encode")
 
-    # Stats
+    # Stats (for PPMI → embeddings)
     print("Building statistics...")
     t0 = time.time()
     stats = build_stats(enc_train, V, cfg, res.primary_device)
@@ -73,47 +101,54 @@ def run_pipeline(cfg: Config) -> Dict:
         torch.cuda.empty_cache()
     mon.snapshot("after-embed")
 
-    # KN
-    print("Building KN...")
+    # Bigram transitions (for spectral Wq only)
+    print("Building bigram transitions...")
     t0 = time.time()
-    kn = build_kn_simple(enc_train, V, cfg.kn_max_order, res.primary_device)
+    bg_trans = _build_bigram_trans(enc_train, V, res.primary_device)
     cfg.unk_id = vocab.unk_id
-    print(f"  KN in {time.time()-t0:.1f}s")
-    mon.snapshot("after-kn")
+    print(f"  bigrams in {time.time()-t0:.1f}s")
+    mon.snapshot("after-bigram")
 
-    # Spectral decomposition → Wq, Wk, Wv, per-dimension weights
+    # Spectral decomposition → Wq, Wk, Wv, spectral weights
     print("Discovering spectral weights (knowledge circles)...")
     t0 = time.time()
     Wq, Wk, Wv, spectral_weights = build_spectral_heads(
-        embeddings, kn["bg_trans"], V, cfg.embed_dim, cfg.n_heads, res.primary_device,
+        embeddings, bg_trans, V, cfg.embed_dim, cfg.n_heads, res.primary_device,
     )
-    print(f"  spectral weights in {time.time()-t0:.1f}s")
+    del bg_trans
+    gc.collect()
+    print(f"  spectral in {time.time()-t0:.1f}s")
     mon.snapshot("after-spectral")
 
-    # Build Statistical Transformer
-    print(f"Assembling StatTransformer (d={cfg.embed_dim}, layers={cfg.n_layers})...")
+    # Build transformer — distribute across GPUs if available
+    devices = [res.primary_device]
+    if res.multi_gpu and len(res.gpu_ids) > 1:
+        devices = [torch.device(f"cuda:{i}") for i in res.gpu_ids]
+
+    print(f"Assembling StatTransformer (d={cfg.embed_dim}, layers={cfg.n_layers}, devices={len(devices)})...")
     transformer = StatTransformer(
         embeddings=embeddings,
         Wq=Wq, Wk=Wk, Wv=Wv,
         spectral_weights=spectral_weights,
         idf=idf,
-        unigram_prob=kn["uni_prob"],
+        unigram_prob=torch.ones(V, device=res.primary_device) / V,
         n_layers=cfg.n_layers,
         context_len=cfg.context_len,
         pos_decay=cfg.pos_decay,
+        devices=devices,
     )
 
-    # Eval
+    # Eval — pure transformer only
     print("Running evaluation...")
     t_eval = time.time()
     results: Dict = {}
 
     print("  [eval] Layer diagnostics...")
-    results["layers"] = eval_layers(transformer, kn, enc_valid, cfg, res.primary_device)
+    results["layers"] = eval_layers(transformer, V, enc_valid, cfg, res.primary_device)
 
     if cfg.eval_ood_cloze:
         print("  [eval] OOD cloze...")
-        results["ood"] = eval_ood(transformer, kn, vocab, cfg, res.primary_device)
+        results["ood"] = eval_ood(transformer, V, vocab, cfg, res.primary_device)
 
     print(f"  Total eval: {time.time()-t_eval:.1f}s")
     mon.snapshot("post-eval")

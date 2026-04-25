@@ -187,20 +187,30 @@ class StatTransformer:
     """
 
     def __init__(self, embeddings, Wq, Wk, Wv, spectral_weights, idf,
-                 unigram_prob, n_layers=2, context_len=8, pos_decay=0.1):
+                 unigram_prob, n_layers=2, context_len=8, pos_decay=0.1,
+                 devices=None):
+        self.device = embeddings.device
         self.embeddings = embeddings
         self.E_norm = embeddings / embeddings.norm(dim=1, keepdim=True).clamp(min=1e-9)
         self.Wq = Wq
         self.Wk = Wk
         self.Wv = Wv
-        self.spectral_weights = spectral_weights  # [d]
+        self.spectral_weights = spectral_weights
         self.idf = idf
         self.unigram = unigram_prob
         self.V, self.d = embeddings.shape
         self.n_layers = n_layers
         self.context_len = context_len
         self.pos_decay = pos_decay
-        self.device = embeddings.device
+
+        # Multi-GPU: replicate FFN data on secondary devices
+        self.devices = devices or [self.device]
+        self.E_norm_parts = [self.E_norm]
+        self.embed_parts = [self.embeddings]
+        if len(self.devices) > 1:
+            for dev in self.devices[1:]:
+                self.E_norm_parts.append(self.E_norm.to(dev))
+                self.embed_parts.append(self.embeddings.to(dev))
 
     def _attention(self, Q, K, V, causal, pad_mask):
         """Spectrally-weighted attention. No multi-head splitting."""
@@ -212,22 +222,34 @@ class StatTransformer:
         attn_w = F.softmax(scores, dim=-1)
         return torch.matmul(attn_w, V)  # [B, S, d]
 
+    def _ffn_chunk(self, xi, E_n, E_raw):
+        sim = xi @ E_n.T / math.sqrt(self.d)
+        h = F.relu(sim)
+        h = h / h.sum(dim=-1, keepdim=True).clamp(min=1e-9)
+        return h @ E_raw
+
     def _ffn(self, x):
-        """Statistical FFN: vocabulary as memory bank."""
+        """Statistical FFN: vocabulary as memory bank. Multi-GPU aware."""
         B, S, D = x.shape
-        out = torch.zeros_like(x)
-        max_elems = 500_000_000  # ~2GB budget
+        n_dev = len(self.devices)
+        max_elems = 500_000_000
         chunk = max(1, max_elems // (S * self.V))
         chunk = min(chunk, B)
+        out = torch.zeros_like(x)
 
-        for i in range(0, B, chunk):
-            j = min(i + chunk, B)
-            xi = x[i:j]
-            sim = xi @ self.E_norm.T / math.sqrt(self.d)
-            h = F.relu(sim)
-            h_sum = h.sum(dim=-1, keepdim=True).clamp(min=1e-9)
-            h = h / h_sum
-            out[i:j] = h @ self.embeddings
+        if n_dev <= 1:
+            for i in range(0, B, chunk):
+                j = min(i + chunk, B)
+                out[i:j] = self._ffn_chunk(x[i:j], self.E_norm, self.embeddings)
+        else:
+            # Distribute chunks across GPUs
+            chunks = [(i, min(i + chunk, B)) for i in range(0, B, chunk)]
+            for ci, (start, end) in enumerate(chunks):
+                dev_idx = ci % n_dev
+                dev = self.devices[dev_idx]
+                xi = x[start:end].to(dev)
+                res = self._ffn_chunk(xi, self.E_norm_parts[dev_idx], self.embed_parts[dev_idx])
+                out[start:end] = res.to(self.device)
         return out
 
     def score_batch(self, contexts):
