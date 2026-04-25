@@ -1,6 +1,7 @@
 """v7 Pipeline: data -> knowledge -> spectrum -> triangle transformer -> eval.
-ZERO hyperparameters. Everything derived from data."""
-import gc, json, math, os, time
+ZERO hyperparameters. Everything derived from data.
+Caches expensive computations (SVD, stats, vocab) for reuse."""
+import gc, hashlib, json, math, os, time
 from typing import Dict, List
 import numpy as np, torch
 
@@ -14,8 +15,7 @@ from .tokenizer import build_vocab, encode_stream
 
 
 def _measure_knowledge(encoded: List[np.ndarray], V: int) -> Dict:
-    """Measure intrinsic knowledge from raw bigram counts.
-    No PPMI, no SVD, no model. Pure Shannon."""
+    """Measure intrinsic knowledge from raw bigram counts."""
     pair_counts = {}
     word_counts = np.zeros(V, dtype=np.float64)
     total = 0
@@ -75,6 +75,36 @@ def _build_bigram_trans(encoded, V, device):
     return bg_trans
 
 
+def _cache_key(cfg, n_train, V):
+    """Deterministic cache key from data parameters."""
+    sig = f"{cfg.dataset}|{n_train}|V{V}|ppmi{cfg.min_ppmi}|var{cfg.var_target}"
+    sig += f"|sw{cfg.stat_window}|bw{cfg.bigram_window}|mpc{cfg.min_pair_count}"
+    sig += f"|mv{cfg.max_vocab}|mc{cfg.min_count}|seed{cfg.seed}"
+    return hashlib.md5(sig.encode()).hexdigest()[:12]
+
+
+def _try_load_cache(cache_dir, key):
+    """Load cached spectrum if available."""
+    path = os.path.join(cache_dir, f"spectrum_{key}.pt")
+    if os.path.exists(path):
+        try:
+            data = torch.load(path, map_location="cpu", weights_only=False)
+            print(f"  ✓ Loaded from cache: {path}")
+            return data
+        except Exception as e:
+            print(f"  ⚠ Cache corrupt, rebuilding: {e}")
+    return None
+
+
+def _save_cache(cache_dir, key, data):
+    """Save spectrum to cache."""
+    os.makedirs(cache_dir, exist_ok=True)
+    path = os.path.join(cache_dir, f"spectrum_{key}.pt")
+    torch.save(data, path)
+    size_mb = os.path.getsize(path) / 1e6
+    print(f"  ✓ Saved to cache: {path} ({size_mb:.1f}MB)")
+
+
 def run_pipeline(cfg: Config) -> Dict:
     torch.manual_seed(cfg.seed)
     np.random.seed(cfg.seed)
@@ -95,7 +125,8 @@ def run_pipeline(cfg: Config) -> Dict:
     print("Loading dataset...")
     t0 = time.time()
     train_lines, valid_lines = load_dataset(cfg)
-    print(f"  train={len(train_lines)} valid={len(valid_lines)} ({time.time()-t0:.1f}s)")
+    n_train = len(train_lines)
+    print(f"  train={n_train} valid={len(valid_lines)} ({time.time()-t0:.1f}s)")
 
     print("Building vocabulary...")
     t0 = time.time()
@@ -113,7 +144,7 @@ def run_pipeline(cfg: Config) -> Dict:
     mon.snapshot("after-encode")
 
     # ══════════════════════════════════════════════════════════════
-    # KNOWLEDGE MEASUREMENT (before any model)
+    # KNOWLEDGE MEASUREMENT
     # ══════════════════════════════════════════════════════════════
     print("Measuring knowledge potential...")
     t0 = time.time()
@@ -123,7 +154,6 @@ def run_pipeline(cfg: Config) -> Dict:
     H = knowledge["H_conditional"]
     H_max = knowledge["H_max"]
 
-    # Derive L from entropy ratio
     if H > 0.1:
         n_layers = max(1, math.ceil(math.log2(H_max / H)))
     else:
@@ -133,50 +163,67 @@ def run_pipeline(cfg: Config) -> Dict:
     print(f"  H_max = log2({V}) = {H_max:.2f} bits")
     print(f"  Knowledge K = {K:.4f} ({K*100:.1f}%)")
     print(f"  PPL bound = {ppl_bound:.1f}")
-    # Coverage check: N vs V*log(V) (Covering Lemma)
     N = knowledge["N"]
-    E = knowledge["E"]
     cover_threshold = V * math.log(V) if V > 1 else 1
     coverage = N / cover_threshold
     print(f"  Coverage: N={N:,} / V·ln(V)={cover_threshold:,.0f} = {coverage:.2f}")
     if coverage < 1.0:
         print(f"  ⚠ INSUFFICIENT DATA: need {cover_threshold:,.0f} tokens, have {N:,}")
-        print(f"    SVD vectors will be unstable. PPL >> PPL_bound expected.")
     else:
         print(f"  ✓ Data sufficient for stable spectral extraction")
-
     print(f"  Layers L = ceil(log2({H_max:.1f}/{H:.1f})) = {n_layers}")
     print(f"  ({time.time()-t0:.1f}s)")
     print("-" * 72)
 
     # ══════════════════════════════════════════════════════════════
-    # BUILD SPECTRUM (auto threshold from noise floor)
+    # BUILD SPECTRUM (with caching)
     # ══════════════════════════════════════════════════════════════
-    print("Building co-occurrence statistics...")
-    t0 = time.time()
-    stats = build_stats(enc_train, V, cfg, res.primary_device)
-    print(f"  stats in {time.time()-t0:.1f}s")
-
-    print("Building bigram transitions...")
-    t0 = time.time()
-    bg_trans = _build_bigram_trans(enc_train, V, res.primary_device)
     cfg.unk_id = vocab.unk_id
-    print(f"  bigrams in {time.time()-t0:.1f}s")
-    mon.snapshot("after-stats")
+    key = _cache_key(cfg, n_train, V)
+    cached = _try_load_cache(cfg.cache_dir, key)
 
-    print("Building from spectrum (auto threshold)...")
-    t0 = time.time()
-    embeddings, Wq, Wk, S_raw, idf, d = build_all_from_spectrum(
-        stats.ctx_rows, stats.ctx_cols, stats.ctx_counts,
-        stats.unigram_counts, bg_trans, V, cfg.min_ppmi,
-        res.primary_device, cfg.var_target,
-    )
-    print(f"  spectrum -> d={d} in {time.time()-t0:.1f}s")
-    del stats, bg_trans
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    mon.snapshot("after-spectrum")
+    if cached is not None:
+        embeddings = cached["embeddings"].to(res.primary_device)
+        Wq = cached["Wq"].to(res.primary_device)
+        Wk = cached["Wk"].to(res.primary_device)
+        S_raw = cached["S_raw"].to(res.primary_device)
+        idf = cached["idf"].to(res.primary_device)
+        d = int(cached["d"])
+        print(f"  d={d} (from cache)")
+        mon.snapshot("after-spectrum")
+    else:
+        print("Building co-occurrence statistics...")
+        t0 = time.time()
+        stats = build_stats(enc_train, V, cfg, res.primary_device)
+        print(f"  stats in {time.time()-t0:.1f}s")
+
+        print("Building bigram transitions...")
+        t0 = time.time()
+        bg_trans = _build_bigram_trans(enc_train, V, res.primary_device)
+        print(f"  bigrams in {time.time()-t0:.1f}s")
+        mon.snapshot("after-stats")
+
+        print("Building from spectrum (auto threshold)...")
+        t0 = time.time()
+        embeddings, Wq, Wk, S_raw, idf, d = build_all_from_spectrum(
+            stats.ctx_rows, stats.ctx_cols, stats.ctx_counts,
+            stats.unigram_counts, bg_trans, V, cfg.min_ppmi,
+            res.primary_device, cfg.var_target,
+        )
+        print(f"  spectrum -> d={d} in {time.time()-t0:.1f}s")
+
+        _save_cache(cfg.cache_dir, key, {
+            "embeddings": embeddings.cpu(),
+            "Wq": Wq.cpu(), "Wk": Wk.cpu(),
+            "S_raw": S_raw.cpu(), "idf": idf.cpu(),
+            "d": d, "V": V, "n_train": n_train,
+        })
+
+        del stats, bg_trans
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        mon.snapshot("after-spectrum")
 
     # ══════════════════════════════════════════════════════════════
     # ASSEMBLE TRIANGLE TRANSFORMER
@@ -217,7 +264,6 @@ def run_pipeline(cfg: Config) -> Dict:
         print("  [eval] OOD cloze...")
         results["ood"] = eval_ood(transformer, V, vocab, cfg, res.primary_device)
 
-    # Efficiency report
     if "StatTransformer" in results.get("layers", {}):
         ppl_actual = results["layers"]["StatTransformer"]["ppl"]
         efficiency = ppl_bound / ppl_actual if ppl_actual > 0 else 0

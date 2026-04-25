@@ -45,6 +45,7 @@ class Config:
     mem_log_every: int = 100
     mem_warn_percent: float = 88.0
     save_dir: str = "./outputs"
+    cache_dir: str = "./cache"
     seed: int = 42
 
 
