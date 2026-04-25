@@ -1,7 +1,7 @@
-"""v7 Pipeline: stats -> ONE SVD -> transformer -> eval.
+"""v7 Pipeline: measure knowledge -> ONE SVD -> transformer -> eval.
 Genetic architecture: single threshold controls everything."""
-import gc, json, os, time
-from typing import Dict
+import gc, json, math, os, time
+from typing import Dict, List
 import numpy as np, torch
 
 from .config import Config
@@ -11,6 +11,55 @@ from .evaluator import eval_layers, eval_ood
 from .resources import Monitor, detect, setup_cuda_tuning
 from .stats import build_stats
 from .tokenizer import build_vocab, encode_stream
+
+
+def _measure_knowledge(encoded: List[np.ndarray], V: int) -> Dict:
+    """Measure intrinsic knowledge capacity from raw bigram statistics.
+
+    Computes H(next|prev) from bigram counts — no PPMI, no SVD, no model.
+    This is the fundamental limit: no model can achieve PPL < exp(H).
+
+    Returns dict with K (knowledge fraction), H, PPL bound.
+    """
+    # Count bigrams
+    pair_counts = {}
+    word_counts = np.zeros(V, dtype=np.float64)
+    total = 0
+    for arr in encoded:
+        if arr.size < 2:
+            continue
+        for i in range(len(arr) - 1):
+            w, w_next = int(arr[i]), int(arr[i + 1])
+            word_counts[w] += 1
+            key = w * V + w_next
+            pair_counts[key] = pair_counts.get(key, 0) + 1
+            total += 1
+
+    if total == 0:
+        return {"K": 0, "H_conditional": math.log2(V), "H_max": math.log2(V),
+                "ppl_bound": V, "E": 0, "N": 0}
+
+    # H(next|prev) = -Σ P(w) Σ P(w'|w) log2 P(w'|w)
+    H_cond = 0.0
+    for key, count in pair_counts.items():
+        w = key // V
+        p_w = word_counts[w] / total
+        p_next_given_w = count / word_counts[w]
+        H_cond -= p_w * p_next_given_w * math.log2(p_next_given_w + 1e-30)
+
+    H_max = math.log2(V)
+    K = 1.0 - H_cond / H_max if H_max > 0 else 0.0
+    ppl_bound = 2.0 ** H_cond
+    E = len(pair_counts)
+
+    return {
+        "K": K,
+        "H_conditional": H_cond,
+        "H_max": H_max,
+        "ppl_bound": ppl_bound,
+        "E": E,
+        "N": total,
+    }
 
 
 def _build_bigram_trans(encoded, V, device):
@@ -78,6 +127,22 @@ def run_pipeline(cfg: Config) -> Dict:
     print(f"  encoded in {time.time()-t0:.1f}s")
     mon.snapshot("after-encode")
 
+    # ══════════════════════════════════════════════════════════════
+    # STEP 0: Measure knowledge potential (before any model building)
+    # ══════════════════════════════════════════════════════════════
+    print("Measuring knowledge potential...")
+    t0 = time.time()
+    knowledge = _measure_knowledge(enc_train, V)
+    K = knowledge["K"]
+    ppl_bound = knowledge["ppl_bound"]
+    H = knowledge["H_conditional"]
+    print(f"  H(next|prev) = {H:.2f} bits")
+    print(f"  H_max = log2({V}) = {knowledge['H_max']:.2f} bits")
+    print(f"  Knowledge K = {K:.4f} ({K*100:.1f}%)")
+    print(f"  PPL lower bound = {ppl_bound:.1f} (no model can beat this)")
+    print(f"  Measured in {time.time()-t0:.1f}s")
+    print("-" * 72)
+
     # Stats
     print("Building co-occurrence statistics...")
     t0 = time.time()
@@ -127,7 +192,12 @@ def run_pipeline(cfg: Config) -> Dict:
     # Eval
     print("Running evaluation...")
     t_eval = time.time()
-    results: Dict = {"d": d, "spectral_threshold": cfg.spectral_threshold}
+    results: Dict = {
+        "knowledge": knowledge,
+        "d": d,
+        "spectral_threshold": cfg.spectral_threshold,
+        "ppl_bound": ppl_bound,
+    }
 
     print("  [eval] Layer diagnostics...")
     results["layers"] = eval_layers(transformer, V, enc_valid, cfg, res.primary_device)
@@ -135,6 +205,16 @@ def run_pipeline(cfg: Config) -> Dict:
     if cfg.eval_ood_cloze:
         print("  [eval] OOD cloze...")
         results["ood"] = eval_ood(transformer, V, vocab, cfg, res.primary_device)
+
+    # Efficiency report
+    if "StatTransformer" in results.get("layers", {}):
+        ppl_actual = results["layers"]["StatTransformer"]["ppl"]
+        efficiency = ppl_bound / ppl_actual if ppl_actual > 0 else 0
+        print(f"  ── Knowledge Report ──")
+        print(f"  PPL bound (theoretical) = {ppl_bound:.1f}")
+        print(f"  PPL actual (model)      = {ppl_actual:.1f}")
+        print(f"  Efficiency              = {efficiency:.4f} ({efficiency*100:.2f}%)")
+        results["efficiency"] = efficiency
 
     print(f"  Total eval: {time.time()-t_eval:.1f}s")
     mon.snapshot("post-eval")
