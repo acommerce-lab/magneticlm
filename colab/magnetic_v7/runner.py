@@ -133,6 +133,18 @@ def run_pipeline(cfg: Config) -> Dict:
     print(f"  H_max = log2({V}) = {H_max:.2f} bits")
     print(f"  Knowledge K = {K:.4f} ({K*100:.1f}%)")
     print(f"  PPL bound = {ppl_bound:.1f}")
+    # Coverage check: N vs V*log(V) (Covering Lemma)
+    N = knowledge["N"]
+    E = knowledge["E"]
+    cover_threshold = V * math.log(V) if V > 1 else 1
+    coverage = N / cover_threshold
+    print(f"  Coverage: N={N:,} / V·ln(V)={cover_threshold:,.0f} = {coverage:.2f}")
+    if coverage < 1.0:
+        print(f"  ⚠ INSUFFICIENT DATA: need {cover_threshold:,.0f} tokens, have {N:,}")
+        print(f"    SVD vectors will be unstable. PPL >> PPL_bound expected.")
+    else:
+        print(f"  ✓ Data sufficient for stable spectral extraction")
+
     print(f"  Layers L = ceil(log2({H_max:.1f}/{H:.1f})) = {n_layers}")
     print(f"  ({time.time()-t0:.1f}s)")
     print("-" * 72)
@@ -195,6 +207,7 @@ def run_pipeline(cfg: Config) -> Dict:
         "d": d,
         "n_layers": n_layers,
         "ppl_bound": ppl_bound,
+        "coverage": coverage,
     }
 
     print("  [eval] Layer diagnostics...")
