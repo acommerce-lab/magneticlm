@@ -83,8 +83,9 @@ def build_all_from_spectrum(ctx_rows, ctx_cols, ctx_counts, unigram,
     M_embed = embeddings.T @ TE  # [d, d]
     U_m, S_m, Vh_m = torch.linalg.svd(M_embed)
 
-    Wq = U_m.contiguous()
-    Wk = Vh_m.T.contiguous()
+    Wq_base = U_m.contiguous()
+    Wk_base = Vh_m.T.contiguous()
+    print(f"    S_m: max={S_m[0]:.1f}, min={S_m[-1]:.3f}")
 
     # IDF
     degree = torch.zeros(V, dtype=torch.float32)
@@ -93,7 +94,7 @@ def build_all_from_spectrum(ctx_rows, ctx_cols, ctx_counts, unigram,
     idf = idf / idf.max().clamp(min=1e-9)
 
     print(f"    built in {time.time()-t0:.1f}s")
-    return embeddings, Wq, Wk, S_m, idf, d
+    return embeddings, Wq_base, Wk_base, S_m, idf, d
 
 
 # ======================================================================
@@ -121,7 +122,7 @@ class StatTransformer:
     The word representation across layers is a TRIANGLE.
     """
 
-    def __init__(self, embeddings, Wq, Wk, S_raw, idf,
+    def __init__(self, embeddings, Wq_base, Wk_base, S_raw, idf,
                  n_layers=2, context_len=8, pos_decay=0.1, devices=None):
         self.device = embeddings.device
         self.embeddings = embeddings
@@ -130,16 +131,30 @@ class StatTransformer:
         self.context_len = context_len
         self.pos_decay = pos_decay
 
-        # Pre-compute per-layer dimensions (triangle schedule)
+        # Triangle schedule: d, d//2, d//4, ...
         self.d_schedule = []
         for l in range(n_layers):
             dl = max(4, self.d // (2 ** l))
             self.d_schedule.append(dl)
-        print(f"    triangle schedule: {' -> '.join(str(dl) for dl in self.d_schedule)}")
+        print(f"    triangle: {' -> '.join(str(dl) for dl in self.d_schedule)}")
 
-        # Store Wq, Wk truncated per layer
-        self.Wq_layers = [Wq[:dl, :dl].contiguous() for dl in self.d_schedule]
-        self.Wk_layers = [Wk[:dl, :dl].contiguous() for dl in self.d_schedule]
+        # Per-layer Wq/Wk with TRANSITION STRENGTHS built in
+        # Wq = U_m @ diag(sqrt(dampened_S_m)), Wk = V_m @ diag(sqrt(dampened_S_m))
+        # This makes Q @ K.T = x @ M_embed_dampened @ x.T
+        # = "transition-weighted similarity" not just "cosine similarity"
+        mu = S_raw.mean()
+        sigma = S_raw.std().clamp(min=1e-9)
+        self.Wq_layers = []
+        self.Wk_layers = []
+        for l in range(n_layers):
+            dl = self.d_schedule[l]
+            alpha = 2.0 ** l
+            S_dampened = S_raw[:dl] * torch.sigmoid(alpha * (S_raw[:dl] - mu) / sigma)
+            sqrt_Sd = S_dampened.sqrt().clamp(min=1e-9)
+            Wq_l = (Wq_base[:dl, :dl] * sqrt_Sd.unsqueeze(0)).contiguous()
+            Wk_l = (Wk_base[:dl, :dl] * sqrt_Sd.unsqueeze(0)).contiguous()
+            self.Wq_layers.append(Wq_l)
+            self.Wk_layers.append(Wk_l)
 
         # E_norm per layer (truncated embeddings, normalized)
         self.E_norm_layers = []
