@@ -23,7 +23,6 @@ class Config:
     # Spectral Transformer (genetic architecture)
     spectral_threshold: float = 0.01  # fraction of S_max — THE single control
     min_ppmi: float = 0.5
-    n_layers: int = 2
     context_len: int = 8
     pos_decay: float = 0.1
 

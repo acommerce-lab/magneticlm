@@ -140,6 +140,14 @@ def run_pipeline(cfg: Config) -> Dict:
     print(f"  H_max = log2({V}) = {knowledge['H_max']:.2f} bits")
     print(f"  Knowledge K = {K:.4f} ({K*100:.1f}%)")
     print(f"  PPL lower bound = {ppl_bound:.1f} (no model can beat this)")
+
+    # Derive number of layers: L = ceil(log2(H_max / H))
+    H_max = knowledge["H_max"]
+    if H > 0.1:
+        n_layers = max(1, math.ceil(math.log2(H_max / H)))
+    else:
+        n_layers = max(1, math.ceil(math.log2(H_max)))
+    print(f"  Layers L = ceil(log2({H_max:.1f}/{H:.1f})) = {n_layers}")
     print(f"  Measured in {time.time()-t0:.1f}s")
     print("-" * 72)
 
@@ -177,13 +185,13 @@ def run_pipeline(cfg: Config) -> Dict:
     if res.multi_gpu and len(res.gpu_ids) > 1:
         devices = [torch.device(f"cuda:{i}") for i in res.gpu_ids]
 
-    print(f"Assembling StatTransformer (d={d}, layers={cfg.n_layers}, devices={len(devices)})...")
+    print(f"Assembling StatTransformer (d={d}, layers={n_layers}, devices={len(devices)})...")
     transformer = StatTransformer(
         embeddings=embeddings,
         Wq=Wq, Wk=Wk, Wv=Wv,
         S_raw=S_raw,
         idf=idf,
-        n_layers=cfg.n_layers,
+        n_layers=n_layers,
         context_len=cfg.context_len,
         pos_decay=cfg.pos_decay,
         devices=devices,
@@ -195,6 +203,7 @@ def run_pipeline(cfg: Config) -> Dict:
     results: Dict = {
         "knowledge": knowledge,
         "d": d,
+        "n_layers": n_layers,
         "spectral_threshold": cfg.spectral_threshold,
         "ppl_bound": ppl_bound,
     }
