@@ -23,8 +23,8 @@ import torch.nn.functional as F
 # ======================================================================
 
 def build_all_from_spectrum(ctx_rows, ctx_cols, ctx_counts, unigram,
-                            bg_trans, V, min_ppmi, device):
-    """Single SVD -> embeddings + Wq + Wk + S_raw + noise floor.
+                            bg_trans, V, min_ppmi, device, var_target=0.5):
+    """Single SVD -> embeddings + Wq + Wk + S_raw.
 
     Threshold is AUTO-DERIVED from Marchenko-Pastur noise floor:
       S_noise = sigma_ppmi * sqrt(2*E/V)
@@ -63,14 +63,17 @@ def build_all_from_spectrum(ctx_rows, ctx_cols, ctx_counts, unigram,
         print(f"    randomized SVD on [{V}x{V}] PPMI, q={q}...")
         U_full, S_full, Vt_full = torch.svd_lowrank(PPMI_dense, q=q, niter=5)
 
-    # Threshold = noise floor (auto, not user-specified)
-    mask = S_full > S_noise
-    d = int(mask.sum().item())
-    d = max(4, d)
-    print(f"    S_max={S_full[0]:.1f}, cutoff=S_noise={S_noise:.2f} -> d={d}")
+    # Cumulative variance threshold: keep dims explaining 90% of energy
+    S_sq = S_full ** 2
+    cumvar = torch.cumsum(S_sq, dim=0) / S_sq.sum().clamp(min=1e-9)
+    # var_target passed as parameter
+    d = int((cumvar < var_target).sum().item()) + 1
+    d = max(4, min(d, len(S_full)))
+    actual_var = cumvar[d - 1].item()
+    print(f"    cumulative variance: {actual_var:.1%} at d={d} (target={var_target:.0%})")
     print(f"    top-8 S: {', '.join(f'{s:.1f}' for s in S_full[:8].tolist())}")
     if d < len(S_full):
-        print(f"    boundary: S[{d-1}]={S_full[d-1]:.2f} > {S_noise:.2f} > S[{d}]={S_full[d]:.2f}")
+        print(f"    boundary: S[{d-1}]={S_full[d-1]:.2f}, S[{d}]={S_full[d]:.2f}")
 
     U = U_full[:, :d]
     S = S_full[:d]
