@@ -97,7 +97,7 @@ def run_pipeline(cfg: Config) -> Dict:
     embeddings, Wq, Wk, Wv, spectral_weights, idf, d = build_all_from_spectrum(
         stats.ctx_rows, stats.ctx_cols, stats.ctx_counts,
         stats.unigram_counts, bg_trans, V,
-        cfg.spectral_threshold, cfg.min_ppmi, cfg.max_d,
+        cfg.spectral_threshold, cfg.min_ppmi,
         res.primary_device,
     )
     print(f"  spectrum -> d={d} in {time.time()-t0:.1f}s")

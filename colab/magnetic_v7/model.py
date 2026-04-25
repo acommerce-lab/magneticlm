@@ -23,18 +23,11 @@ import torch.nn.functional as F
 
 def build_all_from_spectrum(ctx_rows, ctx_cols, ctx_counts, unigram,
                             bg_trans, V, spectral_threshold, min_ppmi,
-                            max_d, device):
+                            device):
     """Single SVD → embeddings + Wq + Wk + spectral_weights.
 
-    Steps:
-      1. Build PPMI matrix [V, V]
-      2. Project through bigram transitions: M = PPMI @ T.T
-         (combines distributional similarity with sequential patterns)
-      3. SVD(M) → U, S, V.T
-      4. Threshold on S determines d (number of circles)
-      5. Embeddings = U[:, :d] @ sqrt(diag(S[:d]))
-      6. Wq = rotation in spectral space (from SVD of E.T @ T @ E)
-      7. spectral_weights = normalized S
+    The threshold is the ONLY control. No max_d cap.
+    d = number of singular values above threshold * S_max.
 
     Returns: embeddings [V,d], Wq [d,d], Wk [d,d], Wv [d,d],
              spectral_weights [d], d (auto-detected)
@@ -55,26 +48,23 @@ def build_all_from_spectrum(ctx_rows, ctx_cols, ctx_counts, unigram,
     PPMI = torch.sparse_coo_tensor(idx, vals_f.cpu().float(), (V, V)).coalesce()
     PPMI_dense = PPMI.to_dense()
 
-    # SVD on PPMI → initial embeddings (with max_d as upper bound)
-    d_svd = min(max_d, V - 1)
-    print(f"    SVD on [{V}x{V}] PPMI (max_d={d_svd})...")
+    # Full SVD — no artificial cap. Threshold decides d.
+    d_max = V - 1
+    print(f"    SVD on [{V}x{V}] PPMI (free range)...")
     try:
-        U_full, S_full, Vt_full = torch.svd_lowrank(PPMI_dense, q=d_svd, niter=5)
-    except Exception:
         U_full, S_full, Vt_full = torch.linalg.svd(PPMI_dense, full_matrices=False)
-        U_full = U_full[:, :d_svd]
-        S_full = S_full[:d_svd]
-        Vt_full = Vt_full[:d_svd, :]
+    except Exception:
+        U_full, S_full, Vt_full = torch.svd_lowrank(PPMI_dense, q=min(d_max, 2048), niter=5)
 
     # Threshold: keep dimensions where S_i > threshold * S_max
     S_max = S_full[0].item()
     cutoff = spectral_threshold * S_max
     mask = S_full > cutoff
     d = int(mask.sum().item())
-    d = max(4, min(d, d_svd))
+    d = max(4, d)
     print(f"    S_max={S_max:.1f}, cutoff={cutoff:.2f} -> d={d} dimensions (circles)")
     print(f"    top-8 S: {', '.join(f'{s:.1f}' for s in S_full[:8].tolist())}")
-    if d < d_svd:
+    if d < len(S_full):
         print(f"    S at boundary: S[{d-1}]={S_full[d-1]:.2f}, S[{d}]={S_full[d]:.2f}")
 
     U = U_full[:, :d]
