@@ -138,10 +138,8 @@ class StatTransformer:
             self.d_schedule.append(dl)
         print(f"    triangle: {' -> '.join(str(dl) for dl in self.d_schedule)}")
 
-        # Per-layer Wq/Wk with TRANSITION STRENGTHS built in
-        # Wq = U_m @ diag(sqrt(dampened_S_m)), Wk = V_m @ diag(sqrt(dampened_S_m))
-        # This makes Q @ K.T = x @ M_embed_dampened @ x.T
-        # = "transition-weighted similarity" not just "cosine similarity"
+        # Per-layer Wq/Wk: S_m affects DIRECTION (which dims matter)
+        # but NOT MAGNITUDE (softmax temperature stays controlled)
         mu = S_raw.mean()
         sigma = S_raw.std().clamp(min=1e-9)
         self.Wq_layers = []
@@ -150,9 +148,11 @@ class StatTransformer:
             dl = self.d_schedule[l]
             alpha = 2.0 ** l
             S_dampened = S_raw[:dl] * torch.sigmoid(alpha * (S_raw[:dl] - mu) / sigma)
-            sqrt_Sd = S_dampened.sqrt().clamp(min=1e-9)
-            Wq_l = (Wq_base[:dl, :dl] * sqrt_Sd.unsqueeze(0)).contiguous()
-            Wk_l = (Wk_base[:dl, :dl] * sqrt_Sd.unsqueeze(0)).contiguous()
+            # Normalize: keep relative weights, control magnitude
+            S_unit = S_dampened / S_dampened.norm().clamp(min=1e-9) * math.sqrt(dl)
+            sqrt_Su = S_unit.sqrt()
+            Wq_l = (Wq_base[:dl, :dl] * sqrt_Su.unsqueeze(0)).contiguous()
+            Wk_l = (Wk_base[:dl, :dl] * sqrt_Su.unsqueeze(0)).contiguous()
             self.Wq_layers.append(Wq_l)
             self.Wk_layers.append(Wk_l)
 
@@ -242,11 +242,10 @@ class StatTransformer:
             ffn_out = self._ffn(x, E_norm_l, E_raw_l)
             x = _layer_norm(x + ffn_out)
 
-        # Output: transition-projected query against normalized embeddings
-        # Q carries "what I predict" (via Wq with transition strengths)
-        # E_norm carries "what each word IS" (direction only, no frequency bias)
+        # Output: standard transformer scoring
         q_final = x[:, -1, :] @ self.Wq_layers[-1]
-        logits = q_final @ self.E_out_norm.T
+        d_out = self.d_schedule[-1]
+        logits = q_final @ self.E_out_norm.T * math.sqrt(d_out)
 
         for i, c in enumerate(trimmed):
             for t in c:
