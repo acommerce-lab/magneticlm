@@ -81,23 +81,23 @@ def run_pipeline(cfg: Config) -> Dict:
     print(f"  KN in {time.time()-t0:.1f}s")
     mon.snapshot("after-kn")
 
-    # Spectral head discovery → Wq, Wk, Wv
-    print("Discovering spectral heads (knowledge circles)...")
+    # Spectral decomposition → Wq, Wk, Wv, per-dimension weights
+    print("Discovering spectral weights (knowledge circles)...")
     t0 = time.time()
-    Wq, Wk, Wv, head_glow = build_spectral_heads(
+    Wq, Wk, Wv, spectral_weights = build_spectral_heads(
         embeddings, kn["bg_trans"], V, cfg.embed_dim, cfg.n_heads, res.primary_device,
     )
-    print(f"  spectral heads in {time.time()-t0:.1f}s")
+    print(f"  spectral weights in {time.time()-t0:.1f}s")
     mon.snapshot("after-spectral")
 
     # Build Statistical Transformer
-    print(f"Assembling StatTransformer (d={cfg.embed_dim}, heads={cfg.n_heads}, layers={cfg.n_layers})...")
+    print(f"Assembling StatTransformer (d={cfg.embed_dim}, layers={cfg.n_layers})...")
     transformer = StatTransformer(
         embeddings=embeddings,
         Wq=Wq, Wk=Wk, Wv=Wv,
+        spectral_weights=spectral_weights,
         idf=idf,
         unigram_prob=kn["uni_prob"],
-        n_heads=cfg.n_heads,
         n_layers=cfg.n_layers,
         context_len=cfg.context_len,
         pos_decay=cfg.pos_decay,

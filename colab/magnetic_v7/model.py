@@ -3,14 +3,15 @@
 Pure transformer architecture. All weights from corpus statistics.
 Same math as a standard transformer — only the weight source differs.
 
-  Q = x @ Wq          where Wq = solve(E.T@E, E.T@T@E)
-  K = x @ Wk          where Wk = I (identity)
-  V = x @ Wv          where Wv = I (identity)
-  scores = Q @ K.T / sqrt(d_head)
-  output = softmax(scores) @ V           ← identical to transformer
-  x = LayerNorm(x + output)              ← identical to transformer
-  FFN(x) = normalize(ReLU(x @ E.T)) @ E ← vocabulary memory lookup
-  x = LayerNorm(x + FFN(x))              ← identical to transformer
+  Wq, Wk from SVD of transition operator M = E.T @ T @ E
+  spectral_weights: per-dimension glow from singular values
+  scores = (Q * spectral_weights) @ K.T / sqrt(d)  ← spectrally-weighted attention
+  x = LayerNorm(x + attn_output)                    ← same as transformer
+  FFN(x) = normalize(ReLU(x @ E.T)) @ E             ← vocabulary memory lookup
+  x = LayerNorm(x + FFN(x))                          ← same as transformer
+
+No multi-head splitting — each SVD dimension is its own "head"
+with continuous spectral weighting. Simpler and more principled.
 """
 
 import math, time
@@ -59,81 +60,49 @@ def build_embeddings(ctx_rows, ctx_cols, ctx_counts, unigram, V, d, min_ppmi, de
 
 
 # ======================================================================
-# 2. Spectral Head Discovery — Wq from SVD of bigram transition matrix
+# 2. Spectral Weights — each dimension = one knowledge circle
 # ======================================================================
 
 def build_spectral_heads(embeddings, bg_trans, V, d, n_heads, device):
-    """Derive Wq via spectral decomposition of bigram transitions.
+    """Spectral decomposition of transition operator in embedding space.
 
-    Instead of arbitrary head count, we analyze the transition matrix T
-    in embedding space to discover natural "knowledge circles":
+    M = E.T @ T @ E  [d, d]
+    SVD(M) = U @ diag(S) @ V.T
 
-      M = E.T @ T @ E   →  [d, d] transition operator in embedding space
-      SVD(M) = U @ S @ V.T
+    Each singular value S_i = glow of knowledge circle i.
+    Each dimension gets its own continuous weight (no discrete heads).
 
-    Each singular triplet (u_i, s_i, v_i) is a knowledge circle:
-      - u_i: the "query direction" (what this circle asks for)
-      - s_i: the "glow" (how strong this circle is)
-      - v_i: the "key direction" (what this circle represents)
-
-    The spectral gap in S tells us how many circles are meaningful.
-    We take the top n_heads and weight them by normalized glow.
-
-    Wq = U[:, :n_heads*d_h] @ diag(scale)   — spectral query projection
-    Wk = V[:, :n_heads*d_h]                  — spectral key projection
-    Wv = identity                             — values are raw embeddings
-
-    Returns: Wq [d, d], Wk [d, d], Wv [d, d], head_glow [n_heads]
+    Returns: Wq [d,d], Wk [d,d], Wv [d,d], spectral_weights [d]
     """
     t0 = time.time()
 
-    # Build transition operator in embedding space: M = E.T @ T @ E
-    TE = torch.sparse.mm(bg_trans, embeddings)  # [V, d]
+    TE = torch.sparse.mm(bg_trans, embeddings)
     M = embeddings.T @ TE  # [d, d]
 
-    # SVD of M → spectral circles
     U, S, Vh = torch.linalg.svd(M)
-    # U: [d, d], S: [d], Vh: [d, d]
 
-    # Spectral gap analysis
     S_np = S.cpu().numpy()
     ratios = S_np[:-1] / (S_np[1:] + 1e-12)
     gap_idx = int(ratios.argmax()) + 1
-    print(f"    spectral gap at {gap_idx} (S[{gap_idx-1}]={S_np[gap_idx-1]:.1f} → S[{gap_idx}]={S_np[gap_idx]:.1f})")
+    print(f"    spectral gap at {gap_idx} (S[{gap_idx-1}]={S_np[gap_idx-1]:.1f} -> S[{gap_idx}]={S_np[gap_idx]:.1f})")
     print(f"    top-8 singular values: {', '.join(f'{s:.1f}' for s in S_np[:8])}")
-    print(f"    using n_heads={n_heads} (natural gap suggests {gap_idx})")
 
-    d_h = d // n_heads
+    # Per-dimension glow: sigmoid normalization
+    mu = S.mean()
+    sigma = S.std().clamp(min=1e-9)
+    spectral_weights = torch.sigmoid(2.0 * (S - mu) / sigma)  # [d]
+    print(f"    spectral weights: min={spectral_weights.min():.3f} max={spectral_weights.max():.3f} mean={spectral_weights.mean():.3f}")
 
-    # Glow normalization: dampen overly bright circles, boost dim ones
-    raw_glow = S[:n_heads * d_h]  # one glow per sub-dimension
-    # Group by head: average glow per head
-    head_glow = raw_glow.view(n_heads, d_h).mean(dim=1)  # [n_heads]
-    mu = head_glow.mean()
-    sigma = head_glow.std().clamp(min=1e-9)
-    # Sigmoid normalization: compress dynamic range
-    head_scale = torch.sigmoid(2.0 * (head_glow - mu) / sigma)  # [n_heads]
-    print(f"    head glow: {', '.join(f'{g:.2f}' for g in head_glow.tolist())}")
-    print(f"    head scale: {', '.join(f'{s:.3f}' for s in head_scale.tolist())}")
-
-    # Build per-dimension scale: expand head_scale to all d_h dims per head
-    dim_scale = head_scale.repeat_interleave(d_h)  # [d]
-
-    # Wq = U[:, :d] @ diag(dim_scale) — spectral query with glow weighting
-    Wq = U[:, :d] * dim_scale.unsqueeze(0)  # [d, d]
-
-    # Wk = V.T[:d, :] transposed = V[:, :d] — spectral key directions
-    Wk = Vh.T[:, :d].contiguous()  # [d, d]
-
-    # Wv = identity
+    Wq = U.contiguous()       # [d, d] spectral rotation for queries
+    Wk = Vh.T.contiguous()    # [d, d] spectral rotation for keys
     Wv = torch.eye(d, device=device)
 
-    print(f"    spectral Wq,Wk,Wv [{d}x{d}] in {time.time()-t0:.1f}s")
-    return Wq, Wk, Wv, head_glow
+    print(f"    Wq,Wk [{d}x{d}] + weights [{d}] in {time.time()-t0:.1f}s")
+    return Wq, Wk, Wv, spectral_weights
 
 
 # ======================================================================
-# 3. KN scoring (kept for comparison only — not part of the transformer)
+# 3. KN scoring (kept for comparison only)
 # ======================================================================
 
 def build_kn_simple(encoded, V, max_order, device):
@@ -191,7 +160,7 @@ def kn_score(kn, context_ids):
 
 
 # ======================================================================
-# 4. Statistical Transformer — same architecture as a real transformer
+# 4. Statistical Transformer — spectrally-weighted attention
 # ======================================================================
 
 def _layer_norm(x, eps=1e-5):
@@ -201,65 +170,54 @@ def _layer_norm(x, eps=1e-5):
 
 
 class StatTransformer:
-    """Pure statistical transformer. Same math as a real transformer.
+    """Pure statistical transformer with spectrally-weighted attention.
 
-    Each layer:
-      1. Q = x @ Wq,  K = x @ Wk,  V = x @ Wv   ← same as transformer
-      2. attn = softmax(Q @ K.T / sqrt(d_h)) @ V   ← same as transformer
-      3. x = LayerNorm(x + attn)                    ← same as transformer
-      4. ffn = VocabFFN(x)                           ← statistical FFN
-      5. x = LayerNorm(x + ffn)                      ← same as transformer
+    No multi-head splitting. Each SVD dimension is its own "head"
+    with continuous spectral weighting:
 
-    The ONLY difference from a real transformer: how W matrices are computed.
+      Q = x @ Wq                          (rotate to spectral space)
+      K = x @ Wk                          (rotate to spectral space)
+      scores = (Q * spectral_weights) @ K.T / sqrt(d)
+      output = softmax(scores) @ V
+      x = LayerNorm(x + output)
+      x = LayerNorm(x + FFN(x))
+
+    Simpler than multi-head, each dimension contributes proportionally
+    to its spectral importance (glow).
     """
 
-    def __init__(self, embeddings, Wq, Wk, Wv, idf, unigram_prob,
-                 n_heads=4, n_layers=2, context_len=8, pos_decay=0.1):
-        self.embeddings = embeddings  # [V, d]
+    def __init__(self, embeddings, Wq, Wk, Wv, spectral_weights, idf,
+                 unigram_prob, n_layers=2, context_len=8, pos_decay=0.1):
+        self.embeddings = embeddings
         self.E_norm = embeddings / embeddings.norm(dim=1, keepdim=True).clamp(min=1e-9)
-        self.Wq = Wq  # [d, d]
-        self.Wk = Wk  # [d, d]
-        self.Wv = Wv  # [d, d]
+        self.Wq = Wq
+        self.Wk = Wk
+        self.Wv = Wv
+        self.spectral_weights = spectral_weights  # [d]
         self.idf = idf
         self.unigram = unigram_prob
         self.V, self.d = embeddings.shape
-        self.n_heads = n_heads
         self.n_layers = n_layers
         self.context_len = context_len
         self.pos_decay = pos_decay
         self.device = embeddings.device
 
-    def _self_attention(self, Q, K, V, causal_mask, key_mask):
-        B, S, D = Q.shape
-        H = self.n_heads
-        d_h = D // H
-
-        Qh = Q.view(B, S, H, d_h).transpose(1, 2)
-        Kh = K.view(B, S, H, d_h).transpose(1, 2)
-        Vh = V.view(B, S, H, d_h).transpose(1, 2)
-
-        scores = torch.matmul(Qh, Kh.transpose(-2, -1)) / math.sqrt(d_h)
-        scores = scores.masked_fill(~causal_mask, -1e9)
-        scores = scores.masked_fill(~key_mask, -1e9)
-
+    def _attention(self, Q, K, V, causal, pad_mask):
+        """Spectrally-weighted attention. No multi-head splitting."""
+        # Q * weights: each spectral dimension weighted by its glow
+        Q_w = Q * self.spectral_weights  # [B, S, d]
+        scores = torch.matmul(Q_w, K.transpose(-2, -1)) / math.sqrt(self.d)  # [B, S, S]
+        scores = scores.masked_fill(~causal, -1e9)
+        scores = scores.masked_fill(~pad_mask, -1e9)
         attn_w = F.softmax(scores, dim=-1)
-        out = torch.matmul(attn_w, Vh)
-        return out.transpose(1, 2).contiguous().view(B, S, D)
+        return torch.matmul(attn_w, V)  # [B, S, d]
 
     def _ffn(self, x):
-        """Statistical FFN: vocabulary as memory bank.
-
-        Like a transformer FFN but W1=E_norm.T, W2=E:
-          h = ReLU(x @ E_norm.T / sqrt(d))   → word activations [V]
-          out = normalize(h) @ E               → weighted sum of embeddings
-
-        Interprets as: "find which words this representation activates,
-        then combine their embeddings as the output."
-        """
+        """Statistical FFN: vocabulary as memory bank."""
         B, S, D = x.shape
         out = torch.zeros_like(x)
-        max_intermediate = 2_000_000_000 // 4  # 2GB float32 budget
-        chunk = max(1, max_intermediate // (S * self.V))
+        max_elems = 500_000_000  # ~2GB budget
+        chunk = max(1, max_elems // (S * self.V))
         chunk = min(chunk, B)
 
         for i in range(0, B, chunk):
@@ -293,15 +251,16 @@ class StatTransformer:
         x = x * pw.unsqueeze(0).unsqueeze(-1)
         x = x * pad_mask.unsqueeze(-1).float()
 
+        # Masks: causal [S, S], pad [B, 1, S]
         causal = torch.tril(torch.ones(S, S, device=self.device, dtype=torch.bool))
-        key_m = pad_mask.unsqueeze(1).unsqueeze(2)
+        p_mask = pad_mask.unsqueeze(1)  # [B, 1, S]
 
         for layer_idx in range(self.n_layers):
             Q = x @ self.Wq
             K = x @ self.Wk
             V_attn = x @ self.Wv
 
-            attn_out = self._self_attention(Q, K, V_attn, causal, key_m)
+            attn_out = self._attention(Q, K, V_attn, causal, p_mask)
             x = _layer_norm(x + attn_out)
 
             ffn_out = self._ffn(x)
