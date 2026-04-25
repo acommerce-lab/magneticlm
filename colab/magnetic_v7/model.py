@@ -162,10 +162,9 @@ class StatTransformer:
             e = embeddings[:, :dl]
             self.E_norm_layers.append(e / e.norm(dim=1, keepdim=True).clamp(min=1e-9))
 
-        # Full E_norm for output scoring (uses last layer's d)
+        # Output embeddings (last layer's d, raw — no normalization)
         d_out = self.d_schedule[-1]
         self.E_out = embeddings[:, :d_out]
-        self.E_out_norm = self.E_out / self.E_out.norm(dim=1, keepdim=True).clamp(min=1e-9)
 
         self.idf = idf
         self.devices = devices or [self.device]
@@ -242,10 +241,9 @@ class StatTransformer:
             ffn_out = self._ffn(x, E_norm_l, E_raw_l)
             x = _layer_norm(x + ffn_out)
 
-        # Output: score against vocab using last layer's dimensions
+        # Output: raw dot product (same as standard transformer)
         q_final = x[:, -1, :]
-        q_final = q_final / q_final.norm(dim=1, keepdim=True).clamp(min=1e-9)
-        logits = q_final @ self.E_out_norm.T / math.sqrt(self.d_schedule[-1])
+        logits = q_final @ self.E_out.T
 
         for i, c in enumerate(trimmed):
             for t in c:
