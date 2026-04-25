@@ -25,10 +25,6 @@ class Config:
     context_len: int = 8
     pos_decay: float = 0.1
 
-    # Cache
-    stat_cache_window: int = 3000
-    cache_lambda: float = 0.12
-
     # Eval
     eval_ppl: bool = True
     eval_hit_rate: bool = True
