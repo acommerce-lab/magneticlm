@@ -206,10 +206,6 @@ class StatTransformer:
     def score_batch(self, contexts):
         with torch.no_grad():
             logits = self._forward(contexts, self.S_raw)
-            for i, c in enumerate(contexts):
-                for t in c[-self.context_len:]:
-                    if 0 <= t < self.V:
-                        logits[i, t] = -1e9
             return F.softmax(logits, dim=1)
 
     def score_single(self, context_ids):
