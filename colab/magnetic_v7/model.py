@@ -242,10 +242,8 @@ class StatTransformer:
             ffn_out = self._ffn(x, E_norm_l, E_raw_l)
             x = _layer_norm(x + ffn_out)
 
-        # Output: standard transformer scoring
-        q_final = x[:, -1, :] @ self.Wq_layers[-1]
-        d_out = self.d_schedule[-1]
-        logits = q_final @ self.E_out_norm.T * math.sqrt(d_out)
+        # Output: h @ E.T (same as GPT-2 — raw dot product, no temperature)
+        logits = x[:, -1, :] @ self.E_out.T
 
         for i, c in enumerate(trimmed):
             for t in c:
