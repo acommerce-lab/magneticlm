@@ -20,8 +20,7 @@ class Config:
     cost_ceiling: float = 20.0
     max_out_edges: int = 200
 
-    # Spectral Transformer (genetic architecture)
-    spectral_threshold: float = 0.01  # fraction of S_max — THE single control
+    # Transformer (all structural params auto-derived from data)
     min_ppmi: float = 0.5
     context_len: int = 8
     pos_decay: float = 0.1
