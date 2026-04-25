@@ -84,11 +84,8 @@ def build_all_from_spectrum(ctx_rows, ctx_cols, ctx_counts, unigram,
     Wk = Vh_m.T.contiguous()
     Wv = torch.eye(d, device=device)
 
-    # Spectral weights from S_m (transition spectrum)
-    mu = S_m.mean()
-    sigma = S_m.std().clamp(min=1e-9)
-    spectral_weights = torch.sigmoid(2.0 * (S_m - mu) / sigma)
-    print(f"    spectral weights [{d}]: min={spectral_weights.min():.3f} max={spectral_weights.max():.3f}")
+    # Return raw S_m — per-layer weights computed in StatTransformer.__init__
+    print(f"    S_m range [{d}]: max={S_m[0]:.1f} min={S_m[-1]:.3f}")
 
     # IDF
     degree = torch.zeros(V, dtype=torch.float32)
@@ -97,7 +94,7 @@ def build_all_from_spectrum(ctx_rows, ctx_cols, ctx_counts, unigram,
     idf = idf / idf.max().clamp(min=1e-9)
 
     print(f"    total build time: {time.time()-t0:.1f}s")
-    return embeddings, Wq, Wk, Wv, spectral_weights, idf, d
+    return embeddings, Wq, Wk, Wv, S_m, idf, d
 
 
 # ======================================================================
@@ -113,13 +110,17 @@ def _layer_norm(x, eps=1e-5):
 class StatTransformer:
     """Pure statistical transformer. Genetic architecture.
 
-    d = number of spectral circles (auto-detected from threshold)
-    Each dimension = one knowledge circle with its own glow weight.
+    Progressive spectral distillation across layers:
+      Layer 0: α=1  → all circles contribute equally (exploration)
+      Layer 1: α=2  → weak circles dampened (focusing)
+      Layer 2: α=4  → only strong circles active (distillation)
+      ...geometric: α = 2^layer
 
-      scores = (Q * spectral_weights) @ K.T / sqrt(d)
+    Same d at every layer (residual connections work).
+    The "cone" effect comes from progressive dampening, not dimension change.
     """
 
-    def __init__(self, embeddings, Wq, Wk, Wv, spectral_weights, idf,
+    def __init__(self, embeddings, Wq, Wk, Wv, S_raw, idf,
                  n_layers=2, context_len=8, pos_decay=0.1, devices=None):
         self.device = embeddings.device
         self.embeddings = embeddings
@@ -127,12 +128,21 @@ class StatTransformer:
         self.Wq = Wq
         self.Wk = Wk
         self.Wv = Wv
-        self.spectral_weights = spectral_weights
+        self.S_raw = S_raw  # raw singular values [d] — used to compute per-layer weights
         self.idf = idf
         self.V, self.d = embeddings.shape
         self.n_layers = n_layers
         self.context_len = context_len
         self.pos_decay = pos_decay
+
+        # Pre-compute per-layer spectral weights (distillation cone)
+        mu = S_raw.mean()
+        sigma = S_raw.std().clamp(min=1e-9)
+        self.layer_weights = []
+        for l in range(n_layers):
+            alpha = 2.0 ** l  # geometric: 1, 2, 4, 8, ...
+            w = torch.sigmoid(alpha * (S_raw - mu) / sigma)
+            self.layer_weights.append(w)
 
         self.devices = devices or [self.device]
         self.E_norm_parts = [self.E_norm]
@@ -142,8 +152,9 @@ class StatTransformer:
                 self.E_norm_parts.append(self.E_norm.to(dev))
                 self.embed_parts.append(self.embeddings.to(dev))
 
-    def _attention(self, Q, K, V, causal, pad_mask):
-        Q_w = Q * self.spectral_weights
+    def _attention(self, Q, K, V, causal, pad_mask, layer_idx):
+        w = self.layer_weights[layer_idx]
+        Q_w = Q * w
         scores = torch.matmul(Q_w, K.transpose(-2, -1)) / math.sqrt(self.d)
         scores = scores.masked_fill(~causal, -1e9)
         scores = scores.masked_fill(~pad_mask, -1e9)
@@ -205,7 +216,7 @@ class StatTransformer:
             Q = x @ self.Wq
             K = x @ self.Wk
             V_attn = x @ self.Wv
-            attn_out = self._attention(Q, K, V_attn, causal, p_mask)
+            attn_out = self._attention(Q, K, V_attn, causal, p_mask, layer_idx)
             x = _layer_norm(x + attn_out)
             ffn_out = self._ffn(x)
             x = _layer_norm(x + ffn_out)

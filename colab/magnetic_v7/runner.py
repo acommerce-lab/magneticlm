@@ -94,7 +94,7 @@ def run_pipeline(cfg: Config) -> Dict:
     # ONE SVD → everything
     print(f"Building from spectrum (threshold={cfg.spectral_threshold})...")
     t0 = time.time()
-    embeddings, Wq, Wk, Wv, spectral_weights, idf, d = build_all_from_spectrum(
+    embeddings, Wq, Wk, Wv, S_raw, idf, d = build_all_from_spectrum(
         stats.ctx_rows, stats.ctx_cols, stats.ctx_counts,
         stats.unigram_counts, bg_trans, V,
         cfg.spectral_threshold, cfg.min_ppmi,
@@ -116,7 +116,7 @@ def run_pipeline(cfg: Config) -> Dict:
     transformer = StatTransformer(
         embeddings=embeddings,
         Wq=Wq, Wk=Wk, Wv=Wv,
-        spectral_weights=spectral_weights,
+        S_raw=S_raw,
         idf=idf,
         n_layers=cfg.n_layers,
         context_len=cfg.context_len,
