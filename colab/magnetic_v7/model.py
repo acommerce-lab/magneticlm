@@ -1,14 +1,11 @@
-"""v7 — Genetic Statistical Transformer.
+"""v7 — Genetic Statistical Transformer with Spectral Refinement.
 
-ZERO hyperparameters. Everything derived from data:
-  d = auto (noise floor from Marchenko-Pastur)
-  L = auto (from knowledge entropy ratio)
-  r = 2 (information-theoretic constant)
-  cone = triangle (dimensions shrink per layer: d, d//2, d//4, ...)
+All structure from statistics. Only S_m (spectral weights) refined iteratively.
+This is NOT full backprop — it's tuning d dials on a pre-built machine.
 
-The word representation across layers is a TRIANGLE, not a rectangle.
-Each layer operates on fewer dimensions — only the strongest spectral
-circles survive deeper layers.
+Architecture: Triangle Transformer (d shrinks per layer)
+Refinement: optimize S_m to minimize cross-entropy on training data
+Saturation: stop when S_m changes < threshold
 """
 
 import math, time
@@ -19,22 +16,13 @@ import torch.nn.functional as F
 
 
 # ======================================================================
-# 1. Build everything from spectrum — zero config
+# 1. Build everything from spectrum
 # ======================================================================
 
 def build_all_from_spectrum(ctx_rows, ctx_cols, ctx_counts, unigram,
                             bg_trans, V, min_ppmi, device, var_target=0.5):
-    """Single SVD -> embeddings + Wq + Wk + S_raw.
-
-    Threshold is AUTO-DERIVED from Marchenko-Pastur noise floor:
-      S_noise = sigma_ppmi * sqrt(2*E/V)
-      Keep S_i > S_noise (signal above noise).
-
-    Returns: embeddings, Wq, Wk, S_raw, idf, d, S_noise
-    """
     t0 = time.time()
 
-    # Build PPMI
     total = ctx_counts.sum().clamp(min=1.0)
     N = unigram.float().sum().clamp(min=1.0)
     p_ab = ctx_counts / total
@@ -44,7 +32,6 @@ def build_all_from_spectrum(ctx_rows, ctx_cols, ctx_counts, unigram,
     keep = ppmi >= min_ppmi
     rows_f, cols_f, vals_f = ctx_rows[keep], ctx_cols[keep], ppmi[keep]
 
-    # Auto noise floor: sigma * sqrt(2*E/V)
     E = int(keep.sum().item())
     sigma_ppmi = float(vals_f.std().item()) if vals_f.numel() > 1 else 1.0
     S_noise = sigma_ppmi * math.sqrt(2.0 * E / max(V, 1))
@@ -54,7 +41,6 @@ def build_all_from_spectrum(ctx_rows, ctx_cols, ctx_counts, unigram,
     PPMI = torch.sparse_coo_tensor(idx, vals_f.cpu().float(), (V, V)).coalesce()
     PPMI_dense = PPMI.to_dense()
 
-    # SVD
     if V <= 5000:
         print(f"    full SVD on [{V}x{V}] PPMI...")
         U_full, S_full, Vt_full = torch.linalg.svd(PPMI_dense, full_matrices=False)
@@ -63,16 +49,13 @@ def build_all_from_spectrum(ctx_rows, ctx_cols, ctx_counts, unigram,
         print(f"    randomized SVD on [{V}x{V}] PPMI, q={q}...")
         U_full, S_full, Vt_full = torch.svd_lowrank(PPMI_dense, q=q, niter=5)
 
-    # Auto-detect d via elbow method (maximum curvature of log-spectrum)
     if var_target > 0:
-        # Manual: cumulative variance threshold
         S_sq = S_full ** 2
         cumvar = torch.cumsum(S_sq, dim=0) / S_sq.sum().clamp(min=1e-9)
         d = int((cumvar < var_target).sum().item()) + 1
         d = max(4, min(d, len(S_full)))
         print(f"    cumulative variance: {cumvar[d-1]:.1%} at d={d} (target={var_target:.0%})")
     else:
-        # Auto: elbow method — find maximum curvature in log-spectrum
         log_S = torch.log(S_full.clamp(min=1e-10))
         if len(log_S) > 4:
             d2 = log_S[:-2] - 2 * log_S[1:-1] + log_S[2:]
@@ -89,20 +72,17 @@ def build_all_from_spectrum(ctx_rows, ctx_cols, ctx_counts, unigram,
 
     U = U_full[:, :d]
     S = S_full[:d]
-
     embeddings = (U * S.sqrt().unsqueeze(0)).to(device)
     print(f"    embeddings [{V}x{d}]")
 
-    # Wq, Wk from transition operator in embedding space
     TE = torch.sparse.mm(bg_trans.cpu(), embeddings.cpu()).to(device)
-    M_embed = embeddings.T @ TE  # [d, d]
+    M_embed = embeddings.T @ TE
     U_m, S_m, Vh_m = torch.linalg.svd(M_embed)
 
     Wq_base = U_m.contiguous()
     Wk_base = Vh_m.T.contiguous()
     print(f"    S_m: max={S_m[0]:.1f}, min={S_m[-1]:.3f}")
 
-    # IDF
     degree = torch.zeros(V, dtype=torch.float32)
     degree.scatter_add_(0, rows_f.cpu(), torch.ones(rows_f.numel(), dtype=torch.float32))
     idf = (1.0 / (1.0 + degree.sqrt())).to(device)
@@ -113,7 +93,7 @@ def build_all_from_spectrum(ctx_rows, ctx_cols, ctx_counts, unigram,
 
 
 # ======================================================================
-# 2. Triangle Transformer — dimensions shrink per layer
+# 2. Triangle Transformer with Spectral Refinement
 # ======================================================================
 
 def _layer_norm(x, eps=1e-5):
@@ -123,18 +103,10 @@ def _layer_norm(x, eps=1e-5):
 
 
 class StatTransformer:
-    """Triangle transformer: d shrinks across layers.
+    """Triangle transformer with refinable spectral weights.
 
-    Layer 0: d₀ = d       (all circles, exploration)
-    Layer 1: d₁ = d//2    (top half, focusing)
-    Layer 2: d₂ = d//4    (top quarter, distillation)
-    ...
-    Layer L-1: d_L = d//2^(L-1) (core only)
-
-    Residual via truncation: x_new = truncate(x + attn(x), d_new)
-    This is valid because SVD dimensions are ordered by importance.
-
-    The word representation across layers is a TRIANGLE.
+    S_raw is the ONLY trainable parameter (d numbers).
+    Everything else (U_m, V_m, E, structure) is fixed from statistics.
     """
 
     def __init__(self, embeddings, Wq_base, Wk_base, S_raw, idf,
@@ -146,71 +118,41 @@ class StatTransformer:
         self.context_len = context_len
         self.pos_decay = pos_decay
 
-        # Triangle schedule: d, d//2, d//4, ...
+        self.Wq_base = Wq_base  # [d, d] fixed rotation
+        self.Wk_base = Wk_base  # [d, d] fixed rotation
+        self.S_raw = S_raw.clone().detach()  # [d] — will be refined
+
         self.d_schedule = []
         for l in range(n_layers):
             dl = max(4, self.d // (2 ** l))
             self.d_schedule.append(dl)
         print(f"    triangle: {' -> '.join(str(dl) for dl in self.d_schedule)}")
 
-        # Per-layer Wq/Wk: S_m affects DIRECTION (which dims matter)
-        # but NOT MAGNITUDE (softmax temperature stays controlled)
-        mu = S_raw.mean()
-        sigma = S_raw.std().clamp(min=1e-9)
-        self.Wq_layers = []
-        self.Wk_layers = []
-        for l in range(n_layers):
-            dl = self.d_schedule[l]
-            alpha = 2.0 ** l
-            S_dampened = S_raw[:dl] * torch.sigmoid(alpha * (S_raw[:dl] - mu) / sigma)
-            # Normalize: keep relative weights, control magnitude
-            S_unit = S_dampened / S_dampened.norm().clamp(min=1e-9) * math.sqrt(dl)
-            sqrt_Su = S_unit.sqrt()
-            Wq_l = (Wq_base[:dl, :dl] * sqrt_Su.unsqueeze(0)).contiguous()
-            Wk_l = (Wk_base[:dl, :dl] * sqrt_Su.unsqueeze(0)).contiguous()
-            self.Wq_layers.append(Wq_l)
-            self.Wk_layers.append(Wk_l)
-
-        # E_norm per layer (truncated embeddings, normalized)
         self.E_norm_layers = []
         for dl in self.d_schedule:
             e = embeddings[:, :dl]
             self.E_norm_layers.append(e / e.norm(dim=1, keepdim=True).clamp(min=1e-9))
 
-        # Output embeddings: normalized (direction only, no frequency bias)
         d_out = self.d_schedule[-1]
         self.E_out = embeddings[:, :d_out]
-        self.E_out_norm = self.E_out / self.E_out.norm(dim=1, keepdim=True).clamp(min=1e-9)
-
         self.idf = idf
         self.devices = devices or [self.device]
 
-    def _attention(self, Q, K, V, causal, pad_mask):
-        d = Q.shape[-1]
-        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(d)
-        scores = scores.masked_fill(~causal, -1e9)
-        scores = scores.masked_fill(~pad_mask, -1e9)
-        attn_w = F.softmax(scores, dim=-1)
-        return torch.matmul(attn_w, V)
+    def _get_Wq_Wk(self, layer_idx, S_param):
+        """Compute Wq/Wk on-the-fly from S_param (differentiable)."""
+        dl = self.d_schedule[layer_idx]
+        alpha = 2.0 ** layer_idx
+        mu = S_param.mean()
+        sigma = S_param.std().clamp(min=1e-9)
+        S_dampened = S_param[:dl] * torch.sigmoid(alpha * (S_param[:dl] - mu) / sigma)
+        S_unit = S_dampened / S_dampened.norm().clamp(min=1e-9) * math.sqrt(dl)
+        sqrt_Su = S_unit.sqrt()
+        Wq = self.Wq_base[:dl, :dl] * sqrt_Su.unsqueeze(0)
+        Wk = self.Wk_base[:dl, :dl] * sqrt_Su.unsqueeze(0)
+        return Wq, Wk
 
-    def _ffn(self, x, E_norm_l, E_raw_l):
-        """FFN with layer-appropriate embedding dimensions."""
-        B, S, D = x.shape
-        out = torch.zeros_like(x)
-        max_elems = 500_000_000
-        chunk = max(1, max_elems // (S * self.V))
-        chunk = min(chunk, B)
-
-        for i in range(0, B, chunk):
-            j = min(i + chunk, B)
-            xi = x[i:j]
-            sim = xi @ E_norm_l.T / math.sqrt(D)
-            h = F.relu(sim)
-            h = h / h.sum(dim=-1, keepdim=True).clamp(min=1e-9)
-            out[i:j] = h @ E_raw_l
-        return out
-
-    def score_batch(self, contexts):
+    def _forward(self, contexts, S_param):
+        """Forward pass using given S_param (supports autograd)."""
         n = len(contexts)
         cl = self.context_len
         trimmed = [c[-cl:] for c in contexts]
@@ -224,9 +166,7 @@ class StatTransformer:
             pad_mask[i, max_len - L:] = True
 
         S = max_len
-
-        # Start with full-d embeddings
-        x = self.embeddings[padded]  # [n, S, d]
+        x = self.embeddings[padded]
         pos = torch.arange(S, dtype=torch.float32, device=self.device)
         pw = torch.exp(-self.pos_decay * (S - 1 - pos))
         x = x * pw.unsqueeze(0).unsqueeze(-1)
@@ -237,35 +177,102 @@ class StatTransformer:
 
         for layer_idx in range(self.n_layers):
             dl = self.d_schedule[layer_idx]
-
-            # Truncate to this layer's dimensions
             x = x[:, :, :dl]
-
-            Wq = self.Wq_layers[layer_idx]
-            Wk = self.Wk_layers[layer_idx]
+            Wq, Wk = self._get_Wq_Wk(layer_idx, S_param)
 
             Q = x @ Wq
             K = x @ Wk
             V_attn = x
 
-            attn_out = self._attention(Q, K, V_attn, causal, p_mask)
+            d_l = Q.shape[-1]
+            scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(d_l)
+            scores = scores.masked_fill(~causal, -1e9)
+            scores = scores.masked_fill(~p_mask, -1e9)
+            attn_w = F.softmax(scores, dim=-1)
+            attn_out = torch.matmul(attn_w, V_attn)
             x = _layer_norm(x + attn_out)
 
-            # FFN with truncated embeddings
             E_norm_l = self.E_norm_layers[layer_idx]
             E_raw_l = self.embeddings[:, :dl]
-            ffn_out = self._ffn(x, E_norm_l, E_raw_l)
+            sim = x @ E_norm_l.T / math.sqrt(dl)
+            h = F.relu(sim)
+            h = h / h.sum(dim=-1, keepdim=True).clamp(min=1e-9)
+            ffn_out = h @ E_raw_l
             x = _layer_norm(x + ffn_out)
 
-        # Output: h @ E.T (same as GPT-2 — raw dot product, no temperature)
         logits = x[:, -1, :] @ self.E_out.T
+        return logits
 
-        for i, c in enumerate(trimmed):
-            for t in c:
-                if 0 <= t < self.V:
-                    logits[i, t] = -1e9
-
-        return F.softmax(logits, dim=1)
+    def score_batch(self, contexts):
+        with torch.no_grad():
+            logits = self._forward(contexts, self.S_raw)
+            for i, c in enumerate(contexts):
+                for t in c[-self.context_len:]:
+                    if 0 <= t < self.V:
+                        logits[i, t] = -1e9
+            return F.softmax(logits, dim=1)
 
     def score_single(self, context_ids):
         return self.score_batch([context_ids])[0]
+
+    def refine(self, encoded, n_epochs, lr=0.01, batch_size=64):
+        """Refine S_raw (d numbers) via gradient descent on training data.
+
+        Only S_raw changes. Everything else is fixed.
+        Each epoch: sample contexts, forward, cross-entropy, backward, update S_raw.
+        """
+        S_param = self.S_raw.clone().detach().requires_grad_(True)
+        optimizer = torch.optim.Adam([S_param], lr=lr)
+
+        # Collect training contexts and targets
+        all_ctx = []
+        all_tgt = []
+        for arr in encoded:
+            if arr.size < 2:
+                continue
+            ids = arr.astype(np.int64)
+            for i in range(len(ids) - 1):
+                ctx = ids[max(0, i - self.context_len):i + 1].tolist()
+                all_ctx.append(ctx)
+                all_tgt.append(int(ids[i + 1]))
+
+        n_total = len(all_ctx)
+        if n_total == 0:
+            return
+
+        indices = list(range(n_total))
+        S_before = S_param.detach().clone()
+
+        for epoch in range(n_epochs):
+            np.random.shuffle(indices)
+            total_loss = 0.0
+            n_batches = 0
+
+            for start in range(0, min(n_total, 5000), batch_size):
+                end = min(start + batch_size, n_total)
+                batch_idx = indices[start:end]
+                batch_ctx = [all_ctx[i] for i in batch_idx]
+                batch_tgt = torch.tensor([all_tgt[i] for i in batch_idx],
+                                         dtype=torch.long, device=self.device)
+
+                optimizer.zero_grad()
+                logits = self._forward(batch_ctx, S_param)
+                loss = F.cross_entropy(logits, batch_tgt)
+                loss.backward()
+                optimizer.step()
+
+                total_loss += loss.item()
+                n_batches += 1
+
+            ppl = math.exp(total_loss / max(n_batches, 1))
+            S_change = (S_param.detach() - S_before).norm() / S_before.norm().clamp(min=1e-9)
+            print(f"    epoch {epoch}: PPL={ppl:.1f}, S_change={S_change:.4f}")
+
+            if S_change < 0.001:
+                print(f"    saturated at epoch {epoch}")
+                break
+
+            S_before = S_param.detach().clone()
+
+        self.S_raw = S_param.detach()
+        print(f"    refined S_raw: max={self.S_raw.max():.1f}, min={self.S_raw.min():.3f}")

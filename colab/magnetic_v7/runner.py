@@ -245,6 +245,16 @@ def run_pipeline(cfg: Config) -> Dict:
     )
 
     # ══════════════════════════════════════════════════════════════
+    # SPECTRAL REFINEMENT (optimize S_raw only — d numbers)
+    # ══════════════════════════════════════════════════════════════
+    print(f"Refining spectral weights (d={d} params, L={n_layers} layers)...")
+    t0 = time.time()
+    max_epochs = max(3, n_layers * 2)
+    transformer.refine(enc_train, n_epochs=max_epochs, lr=0.01)
+    print(f"  refined in {time.time()-t0:.1f}s")
+    mon.snapshot("after-refine")
+
+    # ══════════════════════════════════════════════════════════════
     # EVALUATION
     # ══════════════════════════════════════════════════════════════
     print("Running evaluation...")
