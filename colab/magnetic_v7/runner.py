@@ -186,8 +186,6 @@ def run_pipeline(cfg: Config) -> Dict:
         embeddings = cached["embeddings"].to(res.primary_device)
         Wq = cached["Wq"].to(res.primary_device)
         Wk = cached["Wk"].to(res.primary_device)
-        S_raw = cached["S_raw"].to(res.primary_device)
-        idf = cached["idf"].to(res.primary_device)
         d = int(cached["d"])
         n_heads = int(cached.get("n_heads", 4))
         print(f"  d={d}, n_heads={n_heads} (from cache)")
@@ -206,7 +204,7 @@ def run_pipeline(cfg: Config) -> Dict:
 
         print("Building from spectrum (auto threshold)...")
         t0 = time.time()
-        embeddings, Wq, Wk, S_raw, idf, d, n_heads = build_all_from_spectrum(
+        embeddings, Wq, Wk, d, n_heads = build_all_from_spectrum(
             stats.ctx_rows, stats.ctx_cols, stats.ctx_counts,
             stats.unigram_counts, bg_trans, V, cfg.min_ppmi,
             res.primary_device, cfg.var_target,
@@ -216,7 +214,6 @@ def run_pipeline(cfg: Config) -> Dict:
         _save_cache(cfg.cache_dir, key, {
             "embeddings": embeddings.cpu(),
             "Wq": Wq.cpu(), "Wk": Wk.cpu(),
-            "S_raw": S_raw.cpu(), "idf": idf.cpu(),
             "d": d, "n_heads": n_heads, "V": V, "n_train": n_train,
         })
 
@@ -227,24 +224,24 @@ def run_pipeline(cfg: Config) -> Dict:
         mon.snapshot("after-spectrum")
 
     # ══════════════════════════════════════════════════════════════
-    # ASSEMBLE TRANSFORMER (standard shape: d constant, multi-head)
+    # ASSEMBLE TRANSFORMER
     # ══════════════════════════════════════════════════════════════
     print(f"Assembling StatTransformer (d={d}, L={n_layers})...")
     transformer = StatTransformer(
         embeddings=embeddings,
-        Wq=Wq, Wk=Wk,
-        idf=idf,
+        Wq_init=Wq, Wk_init=Wk,
         n_heads=n_heads,
         n_layers=n_layers,
         context_len=cfg.context_len,
         pos_decay=cfg.pos_decay,
     )
 
-    # Optional refinement (epochs = L from entropy, same formula)
+    # Optional refinement (early stopping)
     if cfg.refine:
-        print(f"Refining Wq/Wk ({n_layers} epochs from L=ceil(log2(H_max/H)))...")
+        print(f"Refining ALL weights (early stopping, patience=3)...")
         t0 = time.time()
-        transformer.refine(enc_train, n_epochs=n_layers)
+        transformer.refine(enc_train)
+        print(f"  refined in {time.time()-t0:.1f}s")
         print(f"  refined in {time.time()-t0:.1f}s")
 
     # ══════════════════════════════════════════════════════════════
