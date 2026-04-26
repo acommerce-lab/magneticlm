@@ -22,7 +22,7 @@ class Config:
 
     # Transformer
     var_target: float = 0.3
-    refine_epochs: int = 0      # 0 = pure statistics, >0 = refine Wq/Wk    # cumulative variance to retain (0.3=30% structural core)
+    refine: bool = False        # False = pure statistics, True = refine Wq/Wk (epochs auto)    # cumulative variance to retain (0.3=30% structural core)
     min_ppmi: float = 0.5
     context_len: int = 8
     pos_decay: float = 0.1
