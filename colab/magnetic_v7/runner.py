@@ -240,7 +240,12 @@ def run_pipeline(cfg: Config) -> Dict:
         pos_decay=cfg.pos_decay,
     )
 
-
+    # Optional refinement
+    if cfg.refine_epochs > 0:
+        print(f"Refining Wq/Wk ({cfg.refine_epochs} epochs)...")
+        t0 = time.time()
+        transformer.refine(enc_train, n_epochs=cfg.refine_epochs)
+        print(f"  refined in {time.time()-t0:.1f}s")
 
     # ══════════════════════════════════════════════════════════════
     # EVALUATION

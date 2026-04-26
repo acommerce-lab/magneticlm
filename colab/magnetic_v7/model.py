@@ -201,9 +201,79 @@ class StatTransformer:
             ffn_out = self._ffn(x)
             x = _layer_norm(x + ffn_out)
 
-        # Output: h @ E.T (same as GPT-2)
-        logits = x[:, -1, :] @ self.embeddings.T
+        # Output: h @ E.T / sqrt(d) — temperature scales logits for any d
+        logits = x[:, -1, :] @ self.embeddings.T / math.sqrt(self.d)
         return F.softmax(logits, dim=1)
 
     def score_single(self, context_ids):
         return self.score_batch([context_ids])[0]
+
+    def refine(self, encoded, n_epochs, lr=0.01, batch_size=64):
+        """Optional: refine Wq/Wk via gradient descent on training data."""
+        Wq_param = self.Wq.clone().detach().requires_grad_(True)
+        Wk_param = self.Wk.clone().detach().requires_grad_(True)
+        optimizer = torch.optim.Adam([Wq_param, Wk_param], lr=lr)
+
+        all_ctx, all_tgt = [], []
+        for arr in encoded:
+            if arr.size < 2:
+                continue
+            ids = arr.astype(np.int64)
+            for i in range(len(ids) - 1):
+                ctx = ids[max(0, i - self.context_len):i + 1].tolist()
+                all_ctx.append(ctx)
+                all_tgt.append(int(ids[i + 1]))
+
+        n_total = len(all_ctx)
+        if n_total == 0:
+            return
+        indices = list(range(n_total))
+
+        for epoch in range(n_epochs):
+            np.random.shuffle(indices)
+            total_loss, n_batches = 0.0, 0
+
+            for start in range(0, min(n_total, 5000), batch_size):
+                end = min(start + batch_size, n_total)
+                batch_idx = indices[start:end]
+                batch_ctx = [all_ctx[i] for i in batch_idx]
+                batch_tgt = torch.tensor([all_tgt[i] for i in batch_idx],
+                                         dtype=torch.long, device=self.device)
+
+                optimizer.zero_grad()
+                # Forward with current params
+                n = len(batch_ctx)
+                cl = self.context_len
+                trimmed = [c[-cl:] for c in batch_ctx]
+                max_len = max(len(c) for c in trimmed)
+                padded = torch.zeros(n, max_len, dtype=torch.long, device=self.device)
+                pad_mask = torch.zeros(n, max_len, dtype=torch.bool, device=self.device)
+                for i, c in enumerate(trimmed):
+                    L = len(c)
+                    padded[i, max_len-L:] = torch.tensor(c, dtype=torch.long, device=self.device)
+                    pad_mask[i, max_len-L:] = True
+                S = max_len
+                x = self.embeddings[padded]
+                pos = torch.arange(S, dtype=torch.float32, device=self.device)
+                pw = torch.exp(-self.pos_decay * (S - 1 - pos))
+                x = x * pw.unsqueeze(0).unsqueeze(-1) * pad_mask.unsqueeze(-1).float()
+                causal = torch.tril(torch.ones(S, S, device=self.device, dtype=torch.bool))
+                p_mask = pad_mask.unsqueeze(1)
+                for _ in range(self.n_layers):
+                    Q = x @ Wq_param
+                    K = x @ Wk_param
+                    attn_out = self._attention(Q, K, x, causal, p_mask)
+                    x = _layer_norm(x + attn_out)
+                    x = _layer_norm(x + self._ffn(x))
+                logits = x[:, -1, :] @ self.embeddings.T / math.sqrt(self.d)
+                loss = F.cross_entropy(logits, batch_tgt)
+                loss.backward()
+                optimizer.step()
+                total_loss += loss.item()
+                n_batches += 1
+
+            ppl = math.exp(total_loss / max(n_batches, 1))
+            print(f"    epoch {epoch}: PPL={ppl:.1f}")
+
+        self.Wq = Wq_param.detach()
+        self.Wk = Wk_param.detach()
