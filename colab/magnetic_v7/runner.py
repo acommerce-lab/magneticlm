@@ -189,7 +189,8 @@ def run_pipeline(cfg: Config) -> Dict:
         S_raw = cached["S_raw"].to(res.primary_device)
         idf = cached["idf"].to(res.primary_device)
         d = int(cached["d"])
-        print(f"  d={d} (from cache)")
+        n_heads = int(cached.get("n_heads", 4))
+        print(f"  d={d}, n_heads={n_heads} (from cache)")
         mon.snapshot("after-spectrum")
     else:
         print("Building co-occurrence statistics...")
@@ -205,7 +206,7 @@ def run_pipeline(cfg: Config) -> Dict:
 
         print("Building from spectrum (auto threshold)...")
         t0 = time.time()
-        embeddings, Wq, Wk, S_raw, idf, d = build_all_from_spectrum(
+        embeddings, Wq, Wk, S_raw, idf, d, n_heads = build_all_from_spectrum(
             stats.ctx_rows, stats.ctx_cols, stats.ctx_counts,
             stats.unigram_counts, bg_trans, V, cfg.min_ppmi,
             res.primary_device, cfg.var_target,
@@ -216,7 +217,7 @@ def run_pipeline(cfg: Config) -> Dict:
             "embeddings": embeddings.cpu(),
             "Wq": Wq.cpu(), "Wk": Wk.cpu(),
             "S_raw": S_raw.cpu(), "idf": idf.cpu(),
-            "d": d, "V": V, "n_train": n_train,
+            "d": d, "n_heads": n_heads, "V": V, "n_train": n_train,
         })
 
         del stats, bg_trans
@@ -226,33 +227,21 @@ def run_pipeline(cfg: Config) -> Dict:
         mon.snapshot("after-spectrum")
 
     # ══════════════════════════════════════════════════════════════
-    # ASSEMBLE TRIANGLE TRANSFORMER
+    # ASSEMBLE TRANSFORMER (standard shape: d constant, multi-head)
     # ══════════════════════════════════════════════════════════════
-    devices = [res.primary_device]
-    if res.multi_gpu and len(res.gpu_ids) > 1:
-        devices = [torch.device(f"cuda:{i}") for i in res.gpu_ids]
-
-    print(f"Assembling Triangle Transformer (d={d}, L={n_layers})...")
+    print(f"Assembling StatTransformer (d={d}, L={n_layers})...")
     transformer = StatTransformer(
         embeddings=embeddings,
-        Wq_base=Wq, Wk_base=Wk,
+        Wq=Wq, Wk=Wk,
         S_raw=S_raw,
         idf=idf,
+        n_heads=n_heads,
         n_layers=n_layers,
         context_len=cfg.context_len,
         pos_decay=cfg.pos_decay,
-        devices=devices,
     )
 
-    # ══════════════════════════════════════════════════════════════
-    # SPECTRAL REFINEMENT (optimize S_raw only — d numbers)
-    # ══════════════════════════════════════════════════════════════
-    print(f"Refining spectral weights (d={d} params, L={n_layers} layers)...")
-    t0 = time.time()
-    max_epochs = max(3, n_layers * 2)
-    transformer.refine(enc_train, n_epochs=max_epochs, lr=0.01)
-    print(f"  refined in {time.time()-t0:.1f}s")
-    mon.snapshot("after-refine")
+
 
     # ══════════════════════════════════════════════════════════════
     # EVALUATION
