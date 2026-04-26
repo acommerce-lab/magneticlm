@@ -59,27 +59,33 @@ def build_all_from_spectrum(ctx_rows, ctx_cols, ctx_counts, unigram,
     embeddings = (U_full[:, :d] * S_full[:d].sqrt().unsqueeze(0)).to(device)
     print(f"    embeddings [{V}x{d}]")
 
-    # Wq, Wk from transition operator
+    # Wq, Wk from transition operator — PURE ROTATIONS (no S_m scaling)
     TE = torch.sparse.mm(bg_trans.cpu(), embeddings.cpu()).to(device)
     M_embed = embeddings.T @ TE
     U_m, S_m, Vh_m = torch.linalg.svd(M_embed)
 
-    Wq = U_m.contiguous()       # [d, d]
-    Wk = Vh_m.T.contiguous()    # [d, d]
+    Wq = U_m.contiguous()       # [d, d] pure rotation
+    Wk = Vh_m.T.contiguous()    # [d, d] pure rotation
     print(f"    S_m: max={S_m[0]:.1f}, min={S_m[-1]:.3f}")
 
-    # Determine n_heads from spectral gap
-    S_np = S_m.cpu().numpy()
-    ratios = S_np[:-1] / (S_np[1:] + 1e-12)
-    gap_idx = int(ratios.argmax()) + 1
-    # n_heads should divide d, pick nearest divisor to gap_idx
+    # Auto n_heads: cluster correlated SVD columns via second SVD
+    # Correlation matrix of U_m columns
+    col_corr = (U_m.T @ U_m).abs()  # [d, d] — how correlated are spectral circles
+    # Find block structure: SVD of correlation matrix
+    _, S_corr, _ = torch.linalg.svd(col_corr)
+    # n_heads = number of significant correlation clusters
+    S_corr_norm = S_corr / S_corr.sum()
+    cumcorr = torch.cumsum(S_corr_norm, dim=0)
+    n_heads_raw = int((cumcorr < 0.9).sum().item()) + 1
+    n_heads_raw = max(1, min(n_heads_raw, d))
+    # Round to nearest divisor of d
     n_heads = 1
-    for h in [gap_idx, 4, 8, 2, 16, d]:
-        if d % h == 0 and h <= d:
+    for h in range(n_heads_raw, 0, -1):
+        if d % h == 0:
             n_heads = h
             break
     d_head = d // n_heads
-    print(f"    spectral gap at {gap_idx} -> n_heads={n_heads}, d_head={d_head}")
+    print(f"    corr clusters -> n_heads={n_heads}, d_head={d_head}")
 
     # IDF
     degree = torch.zeros(V, dtype=torch.float32)
@@ -108,7 +114,7 @@ class StatTransformer:
     No cone. No triangle. Same shape as GPT/BERT.
     """
 
-    def __init__(self, embeddings, Wq, Wk, S_raw, idf, n_heads,
+    def __init__(self, embeddings, Wq, Wk, idf, n_heads,
                  n_layers=2, context_len=8, pos_decay=0.1):
         self.device = embeddings.device
         self.embeddings = embeddings
@@ -119,13 +125,9 @@ class StatTransformer:
         self.context_len = context_len
         self.pos_decay = pos_decay
 
-        # Wq, Wk with normalized S_m (direction not magnitude)
-        mu = S_raw.mean()
-        sigma = S_raw.std().clamp(min=1e-9)
-        S_unit = S_raw / S_raw.norm().clamp(min=1e-9) * math.sqrt(self.d)
-        sqrt_Su = S_unit.sqrt()
-        self.Wq = (Wq * sqrt_Su.unsqueeze(0)).contiguous()  # [d, d]
-        self.Wk = (Wk * sqrt_Su.unsqueeze(0)).contiguous()  # [d, d]
+        # Wq, Wk: pure rotations — no S_m scaling (matches transformer init)
+        self.Wq = Wq  # [d, d]
+        self.Wk = Wk  # [d, d]
 
         # E_norm for FFN
         self.E_norm = embeddings / embeddings.norm(dim=1, keepdim=True).clamp(min=1e-9)

@@ -233,7 +233,6 @@ def run_pipeline(cfg: Config) -> Dict:
     transformer = StatTransformer(
         embeddings=embeddings,
         Wq=Wq, Wk=Wk,
-        S_raw=S_raw,
         idf=idf,
         n_heads=n_heads,
         n_layers=n_layers,
