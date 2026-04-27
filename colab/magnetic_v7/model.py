@@ -255,16 +255,22 @@ class StatTransformer:
         print(f"    train={n_train:,} val={n_val:,} samples, batch={batch_size}")
 
         def _forward_tensor(ctx_padded, E, Wq_list, Wk_list, W1_list, W2_list):
-            """Forward on pre-padded tensor [batch, cl+1]."""
-            pad_mask = ctx_padded > 0  # 0 = padding
-            x = E[ctx_padded]
+            """Forward on pre-padded tensor. All on same device."""
+            dev = E.device
+            pad_mask = ctx_padded.to(dev) > 0
+            x = E[ctx_padded.to(dev)]
             S = x.shape[1]
-            pos = torch.arange(S, dtype=torch.float32, device=self.device)
+            pos = torch.arange(S, dtype=torch.float32, device=dev)
             pw = torch.exp(-self.pos_decay * (S - 1 - pos))
             x = x * pw.unsqueeze(0).unsqueeze(-1) * pad_mask.unsqueeze(-1).float()
-            causal = torch.tril(torch.ones(S, S, device=self.device, dtype=torch.bool))
+            causal = torch.tril(torch.ones(S, S, device=dev, dtype=torch.bool))
             p_mask = pad_mask.unsqueeze(1)
             for l in range(self.n_layers):
+                ldev = Wq_list[l].device
+                if x.device != ldev:
+                    x = x.to(ldev)
+                    causal = causal.to(ldev)
+                    p_mask = p_mask.to(ldev)
                 Q = x @ Wq_list[l]
                 K = x @ Wk_list[l]
                 attn_out = self._attention(Q, K, x, causal, p_mask)
