@@ -238,7 +238,10 @@ def run_pipeline(cfg: Config) -> Dict:
     # ══════════════════════════════════════════════════════════════
     # ASSEMBLE TRANSFORMER
     # ══════════════════════════════════════════════════════════════
-    print(f"Assembling StatTransformer (d={d}, L={n_layers})...")
+    devices = [res.primary_device]
+    if res.multi_gpu and len(res.gpu_ids) > 1:
+        devices = [torch.device(f"cuda:{i}") for i in res.gpu_ids]
+    print(f"Assembling StatTransformer (d={d}, L={n_layers}, GPUs={len(devices)})...")
     transformer = StatTransformer(
         embeddings=embeddings,
         Wq_init=Wq, Wk_init=Wk,
@@ -246,6 +249,7 @@ def run_pipeline(cfg: Config) -> Dict:
         n_layers=n_layers,
         context_len=cfg.context_len,
         pos_decay=cfg.pos_decay,
+        devices=devices,
     )
 
     # Optional refinement (early stopping)

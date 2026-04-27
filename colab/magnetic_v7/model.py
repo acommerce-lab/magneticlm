@@ -92,8 +92,9 @@ def _decay_cache(history, V, device):
 
 class StatTransformer:
     def __init__(self, embeddings, Wq_init, Wk_init, n_heads,
-                 n_layers=2, context_len=8, pos_decay=0.1):
+                 n_layers=2, context_len=8, pos_decay=0.1, devices=None):
         self.device = embeddings.device
+        self.devices = devices or [self.device]
         self.V, self.d = embeddings.shape
         self.n_layers = n_layers
         self.n_heads = n_heads
@@ -103,23 +104,32 @@ class StatTransformer:
         d = self.d
 
         self.embeddings = embeddings.clone()
-        self.Wq_layers = [Wq_init.clone() for _ in range(n_layers)]
-        self.Wk_layers = [Wk_init.clone() for _ in range(n_layers)]
+        # Distribute layers across GPUs
+        self.layer_devices = []
+        for l in range(n_layers):
+            dev = self.devices[l % len(self.devices)]
+            self.layer_devices.append(dev)
+        self.Wq_layers = [Wq_init.clone().to(self.layer_devices[l]) for l in range(n_layers)]
+        self.Wk_layers = [Wk_init.clone().to(self.layer_devices[l]) for l in range(n_layers)]
+        # Keep copies of E on each device
+        self.E_per_device = {self.device: self.embeddings}
+        for dev in self.devices:
+            if dev != self.device:
+                self.E_per_device[dev] = self.embeddings.to(dev)
 
         # FFN: W1 [d, 4d], W2 [4d, d] per layer — initialized from statistics
         d_ff = 4 * d
         self.W1_layers = []
         self.W2_layers = []
         E_norm = embeddings / embeddings.norm(dim=1, keepdim=True).clamp(min=1e-9)
-        for _ in range(n_layers):
-            # W1 init: project to vocab space then truncate to d_ff
-            # Use top-d_ff words' normalized embeddings as W1 rows
+        for l in range(n_layers):
+            dev = self.layer_devices[l]
             if self.V >= d_ff:
-                W1 = E_norm[:d_ff, :].T.contiguous()  # [d, d_ff]
-                W2 = embeddings[:d_ff, :].contiguous()  # [d_ff, d]
+                W1 = E_norm[:d_ff, :].T.contiguous().to(dev)
+                W2 = embeddings[:d_ff, :].contiguous().to(dev)
             else:
-                W1 = torch.randn(d, d_ff, device=self.device) * 0.02
-                W2 = torch.randn(d_ff, d, device=self.device) * 0.02
+                W1 = torch.randn(d, d_ff, device=dev) * 0.02
+                W2 = torch.randn(d_ff, d, device=dev) * 0.02
             self.W1_layers.append(W1)
             self.W2_layers.append(W2)
 
@@ -164,20 +174,24 @@ class StatTransformer:
         p_mask = pad_mask.unsqueeze(1)
 
         for l in range(self.n_layers):
+            dev = Wq_list[l].device
+            if x.device != dev:
+                x = x.to(dev)
+                causal = causal.to(dev)
+                p_mask = p_mask.to(dev)
             Q = x @ Wq_list[l]
             K = x @ Wk_list[l]
             attn_out = self._attention(Q, K, x, causal, p_mask)
             if self.training:
                 attn_out = F.dropout(attn_out, p=self.dropout_p)
             x = _layer_norm(x + attn_out)
-
-            # FFN: ReLU(x @ W1) @ W2
             ffn_h = F.relu(x @ W1_list[l])
             if self.training:
                 ffn_h = F.dropout(ffn_h, p=self.dropout_p)
-            ffn_out = ffn_h @ W2_list[l]
-            x = _layer_norm(x + ffn_out)
+            x = _layer_norm(x + ffn_h @ W2_list[l])
 
+        if x.device != E.device:
+            x = x.to(E.device)
         return x[:, -1, :] @ E.T / math.sqrt(self.d)
 
     def score_batch(self, contexts):
@@ -261,7 +275,9 @@ class StatTransformer:
                 if self.training:
                     ffn_h = F.dropout(ffn_h, p=self.dropout_p)
                 x = _layer_norm(x + ffn_h @ W2_list[l])
-            return x[:, -1, :] @ E.T / math.sqrt(self.d)
+            if x.device != E.device:
+            x = x.to(E.device)
+        return x[:, -1, :] @ E.T / math.sqrt(self.d)
 
         for epoch in range(max_epochs):
             perm = torch.randperm(n_train, device=self.device)
