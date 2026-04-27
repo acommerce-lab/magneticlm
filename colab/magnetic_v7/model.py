@@ -1,14 +1,11 @@
-"""v7 — Statistical Transformer (Transformer-Matched, Trainable).
+"""v7 — Statistical Transformer (Full Training Match).
 
-Matches standard transformer exactly:
-  - Per-layer Wq_l, Wk_l (not shared)
-  - d constant across all layers
-  - Multi-head attention
-  - FFN (vocab memory)
-  - Residual + LayerNorm
-  - Optional refinement: train ALL weights with early stopping
-
-Initialization from corpus statistics. Refinement optional.
+Matches standard transformer:
+  - Per-layer Wq_l, Wk_l (separate per layer)
+  - Trainable FFN (W1, W2 per layer)
+  - d constant, multi-head attention
+  - All weights trainable with early stopping
+  - No sample cap, max_epochs=100
 """
 
 import math, time
@@ -25,7 +22,6 @@ import torch.nn.functional as F
 def build_all_from_spectrum(ctx_rows, ctx_cols, ctx_counts, unigram,
                             bg_trans, V, min_ppmi, device, var_target=0.3):
     t0 = time.time()
-
     total = ctx_counts.sum().clamp(min=1.0)
     N = unigram.float().sum().clamp(min=1.0)
     p_ab = ctx_counts / total
@@ -56,19 +52,16 @@ def build_all_from_spectrum(ctx_rows, ctx_cols, ctx_counts, unigram,
     embeddings = (U_full[:, :d] * S_full[:d].sqrt().unsqueeze(0)).to(device)
     print(f"    embeddings [{V}x{d}]")
 
-    # Wq, Wk per layer from transition operator
     TE = torch.sparse.mm(bg_trans.cpu(), embeddings.cpu()).to(device)
     M_embed = embeddings.T @ TE
     U_m, S_m, Vh_m = torch.linalg.svd(M_embed)
     Wq_init = U_m.contiguous()
     Wk_init = Vh_m.T.contiguous()
-    print(f"    S_m: max={S_m[0]:.1f}, min={S_m[-1]:.3f}")
 
     # Auto n_heads
     col_corr = (U_m.T @ U_m).abs()
     _, S_corr, _ = torch.linalg.svd(col_corr)
-    S_corr_norm = S_corr / S_corr.sum()
-    cumcorr = torch.cumsum(S_corr_norm, dim=0)
+    cumcorr = torch.cumsum(S_corr / S_corr.sum(), dim=0)
     n_heads_raw = int((cumcorr < 0.9).sum().item()) + 1
     n_heads = 1
     for h in range(max(1, n_heads_raw), 0, -1):
@@ -102,8 +95,6 @@ def _decay_cache(history, V, device):
 
 
 class StatTransformer:
-    """Standard-shape statistical transformer. All weights trainable."""
-
     def __init__(self, embeddings, Wq_init, Wk_init, n_heads,
                  n_layers=2, context_len=8, pos_decay=0.1):
         self.device = embeddings.device
@@ -113,14 +104,30 @@ class StatTransformer:
         self.d_head = self.d // n_heads
         self.context_len = context_len
         self.pos_decay = pos_decay
+        d = self.d
 
-        # All weights (initialized from statistics, optionally refined)
         self.embeddings = embeddings.clone()
         self.Wq_layers = [Wq_init.clone() for _ in range(n_layers)]
         self.Wk_layers = [Wk_init.clone() for _ in range(n_layers)]
-        self.E_norm = embeddings / embeddings.norm(dim=1, keepdim=True).clamp(min=1e-9)
 
-        print(f"    d={self.d}, n_heads={n_heads}, d_head={self.d_head}, layers={n_layers}")
+        # FFN: W1 [d, 4d], W2 [4d, d] per layer — initialized from statistics
+        d_ff = 4 * d
+        self.W1_layers = []
+        self.W2_layers = []
+        E_norm = embeddings / embeddings.norm(dim=1, keepdim=True).clamp(min=1e-9)
+        for _ in range(n_layers):
+            # W1 init: project to vocab space then truncate to d_ff
+            # Use top-d_ff words' normalized embeddings as W1 rows
+            if self.V >= d_ff:
+                W1 = E_norm[:d_ff, :].T.contiguous()  # [d, d_ff]
+                W2 = embeddings[:d_ff, :].contiguous()  # [d_ff, d]
+            else:
+                W1 = torch.randn(d, d_ff, device=self.device) * 0.02
+                W2 = torch.randn(d_ff, d, device=self.device) * 0.02
+            self.W1_layers.append(W1)
+            self.W2_layers.append(W2)
+
+        print(f"    d={d}, n_heads={n_heads}, d_head={self.d_head}, layers={n_layers}, d_ff={d_ff}")
 
     def _attention(self, Q, K, V, causal, pad_mask):
         B, S, D = Q.shape
@@ -135,20 +142,7 @@ class StatTransformer:
         out = torch.matmul(attn_w, Vh)
         return out.transpose(1, 2).contiguous().view(B, S, D)
 
-    def _ffn(self, x, E_norm, E_raw):
-        B, S, D = x.shape
-        out = torch.zeros_like(x)
-        chunk = max(1, 500_000_000 // (S * self.V))
-        chunk = min(chunk, B)
-        for i in range(0, B, chunk):
-            j = min(i + chunk, B)
-            sim = x[i:j] @ E_norm.T / math.sqrt(D)
-            h = F.relu(sim)
-            h = h / h.sum(dim=-1, keepdim=True).clamp(min=1e-9)
-            out[i:j] = h @ E_raw
-        return out
-
-    def _forward_logits(self, contexts, embeddings, Wq_layers, Wk_layers, E_norm):
+    def _forward_logits(self, contexts, E, Wq_list, Wk_list, W1_list, W2_list):
         n = len(contexts)
         cl = self.context_len
         trimmed = [c[-cl:] for c in contexts]
@@ -162,7 +156,7 @@ class StatTransformer:
             pad_mask[i, max_len - L:] = True
 
         S = max_len
-        x = embeddings[padded]
+        x = E[padded]
         pos = torch.arange(S, dtype=torch.float32, device=self.device)
         pw = torch.exp(-self.pos_decay * (S - 1 - pos))
         x = x * pw.unsqueeze(0).unsqueeze(-1) * pad_mask.unsqueeze(-1).float()
@@ -171,35 +165,38 @@ class StatTransformer:
         p_mask = pad_mask.unsqueeze(1)
 
         for l in range(self.n_layers):
-            Q = x @ Wq_layers[l]
-            K = x @ Wk_layers[l]
+            Q = x @ Wq_list[l]
+            K = x @ Wk_list[l]
             attn_out = self._attention(Q, K, x, causal, p_mask)
             x = _layer_norm(x + attn_out)
-            ffn_out = self._ffn(x, E_norm, embeddings)
+
+            # FFN: ReLU(x @ W1) @ W2
+            ffn_out = F.relu(x @ W1_list[l]) @ W2_list[l]
             x = _layer_norm(x + ffn_out)
 
-        logits = x[:, -1, :] @ embeddings.T / math.sqrt(self.d)
-        return logits
+        return x[:, -1, :] @ E.T / math.sqrt(self.d)
 
     def score_batch(self, contexts):
         with torch.no_grad():
             logits = self._forward_logits(
-                contexts, self.embeddings, self.Wq_layers, self.Wk_layers, self.E_norm)
+                contexts, self.embeddings,
+                self.Wq_layers, self.Wk_layers,
+                self.W1_layers, self.W2_layers)
             return F.softmax(logits, dim=1)
 
     def score_single(self, context_ids):
         return self.score_batch([context_ids])[0]
 
-    def refine(self, encoded, lr=0.01, batch_size=64, max_epochs=20, patience=3):
-        """Train ALL weights with early stopping."""
-        # Make all weights trainable
-        E_param = self.embeddings.clone().detach().requires_grad_(True)
-        Wq_params = [w.clone().detach().requires_grad_(True) for w in self.Wq_layers]
-        Wk_params = [w.clone().detach().requires_grad_(True) for w in self.Wk_layers]
-        all_params = [E_param] + Wq_params + Wk_params
+    def refine(self, encoded, lr=0.001, batch_size=64, max_epochs=100, patience=5):
+        """Train ALL weights: E, Wq, Wk, W1, W2 with early stopping."""
+        E_p = self.embeddings.clone().detach().requires_grad_(True)
+        Wq_p = [w.clone().detach().requires_grad_(True) for w in self.Wq_layers]
+        Wk_p = [w.clone().detach().requires_grad_(True) for w in self.Wk_layers]
+        W1_p = [w.clone().detach().requires_grad_(True) for w in self.W1_layers]
+        W2_p = [w.clone().detach().requires_grad_(True) for w in self.W2_layers]
+        all_params = [E_p] + Wq_p + Wk_p + W1_p + W2_p
         optimizer = torch.optim.Adam(all_params, lr=lr)
 
-        # Prepare training data
         all_ctx, all_tgt = [], []
         for arr in encoded:
             if arr.size < 2:
@@ -214,17 +211,15 @@ class StatTransformer:
         if n_total == 0:
             return
         indices = list(range(n_total))
-
-        E_norm_param = E_param / E_param.norm(dim=1, keepdim=True).clamp(min=1e-9)
         best_ppl = float('inf')
         no_improve = 0
+        best_state = None
 
         for epoch in range(max_epochs):
             np.random.shuffle(indices)
             total_loss, n_batches = 0.0, 0
-            E_norm_param = E_param / E_param.norm(dim=1, keepdim=True).clamp(min=1e-9)
 
-            for start in range(0, min(n_total, 10000), batch_size):
+            for start in range(0, n_total, batch_size):
                 end = min(start + batch_size, n_total)
                 batch_idx = indices[start:end]
                 batch_ctx = [all_ctx[i] for i in batch_idx]
@@ -232,34 +227,36 @@ class StatTransformer:
                                          dtype=torch.long, device=self.device)
 
                 optimizer.zero_grad()
-                logits = self._forward_logits(
-                    batch_ctx, E_param, Wq_params, Wk_params, E_norm_param)
+                logits = self._forward_logits(batch_ctx, E_p, Wq_p, Wk_p, W1_p, W2_p)
                 loss = F.cross_entropy(logits, batch_tgt)
                 loss.backward()
                 optimizer.step()
-                E_norm_param = E_param / E_param.norm(dim=1, keepdim=True).clamp(min=1e-9)
                 total_loss += loss.item()
                 n_batches += 1
 
             ppl = math.exp(total_loss / max(n_batches, 1))
-            improved = "↓" if ppl < best_ppl else "↑"
-            print(f"    epoch {epoch}: PPL={ppl:.1f} {improved}")
+            tag = "↓" if ppl < best_ppl else "↑"
+            print(f"    epoch {epoch}: PPL={ppl:.1f} {tag}")
 
             if ppl < best_ppl:
                 best_ppl = ppl
                 no_improve = 0
-                # Save best weights
-                best_E = E_param.detach().clone()
-                best_Wq = [w.detach().clone() for w in Wq_params]
-                best_Wk = [w.detach().clone() for w in Wk_params]
+                best_state = {
+                    "E": E_p.detach().clone(),
+                    "Wq": [w.detach().clone() for w in Wq_p],
+                    "Wk": [w.detach().clone() for w in Wk_p],
+                    "W1": [w.detach().clone() for w in W1_p],
+                    "W2": [w.detach().clone() for w in W2_p],
+                }
             else:
                 no_improve += 1
                 if no_improve >= patience:
-                    print(f"    early stop at epoch {epoch} (best PPL={best_ppl:.1f})")
+                    print(f"    early stop at epoch {epoch} (best={best_ppl:.1f})")
                     break
 
-        # Restore best weights
-        self.embeddings = best_E if 'best_E' in dir() else E_param.detach()
-        self.Wq_layers = best_Wq if 'best_Wq' in dir() else [w.detach() for w in Wq_params]
-        self.Wk_layers = best_Wk if 'best_Wk' in dir() else [w.detach() for w in Wk_params]
-        self.E_norm = self.embeddings / self.embeddings.norm(dim=1, keepdim=True).clamp(min=1e-9)
+        if best_state:
+            self.embeddings = best_state["E"]
+            self.Wq_layers = best_state["Wq"]
+            self.Wk_layers = best_state["Wk"]
+            self.W1_layers = best_state["W1"]
+            self.W2_layers = best_state["W2"]
