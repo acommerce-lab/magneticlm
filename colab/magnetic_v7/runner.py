@@ -241,7 +241,7 @@ def run_pipeline(cfg: Config) -> Dict:
     devices = [res.primary_device]
     if res.multi_gpu and len(res.gpu_ids) > 1:
         devices = [torch.device(f"cuda:{i}") for i in res.gpu_ids]
-    print(f"Assembling StatTransformer (d={d}, L={n_layers}, GPUs={len(devices)})...")
+    print(f"Assembling StatTransformer (d={d}, L={n_layers}, device={res.primary_device})...")
     transformer = StatTransformer(
         embeddings=embeddings,
         Wq_init=Wq, Wk_init=Wk,

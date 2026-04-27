@@ -66,11 +66,13 @@ def detect(cfg) -> Resources:
         gpu_ids = list(range(num_gpus))
         primary = torch.device(device_str if device_str.startswith("cuda:") else "cuda:0")
     elif _HAS_XLA:
-        # TPU detected via torch_xla
         primary = xm.xla_device()
-        num_gpus = 0  # not CUDA GPUs
+        num_gpus = 0
         gpu_ids = []
-        n_chips = xm.xrt_world_size() if hasattr(xm, 'xrt_world_size') else 1
+        try:
+            n_chips = xm.xrt_world_size()
+        except Exception:
+            n_chips = 1
         print(f"  TPU detected: {primary}  chips={n_chips}")
     else:
         num_gpus = 0
