@@ -166,10 +166,12 @@ def run_pipeline(cfg: Config) -> Dict:
     H = knowledge["H_conditional"]
     H_max = knowledge["H_max"]
 
+    # n_layers scales with coverage (more data = more layers benefit)
+    coverage_factor = min(4, max(1, int(math.log2(coverage + 1))))
     if H > 0.1:
-        n_layers = max(1, math.ceil(math.log2(H_max / H)))
+        n_layers = max(2, min(6, math.ceil(math.log2(H_max / H)) + coverage_factor - 1))
     else:
-        n_layers = max(1, math.ceil(math.log2(H_max)))
+        n_layers = 2
 
     print(f"  H(next|prev) = {H:.2f} bits")
     print(f"  H_max = log2({V}) = {H_max:.2f} bits")

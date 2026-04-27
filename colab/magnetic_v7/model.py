@@ -58,16 +58,12 @@ def build_all_from_spectrum(ctx_rows, ctx_cols, ctx_counts, unigram,
     Wq_init = U_m.contiguous()
     Wk_init = Vh_m.T.contiguous()
 
-    # Auto n_heads
-    col_corr = (U_m.T @ U_m).abs()
-    _, S_corr, _ = torch.linalg.svd(col_corr)
-    cumcorr = torch.cumsum(S_corr / S_corr.sum(), dim=0)
-    n_heads_raw = int((cumcorr < 0.9).sum().item()) + 1
-    n_heads = 1
-    for h in range(max(1, n_heads_raw), 0, -1):
-        if d % h == 0:
-            n_heads = h
-            break
+    # Auto n_heads: find best divisor of d in range [2, 16]
+    best_heads = 1
+    for h in [2, 3, 4, 6, 7, 8, 12, 16]:
+        if d % h == 0 and h <= d // 2:
+            best_heads = h
+    n_heads = best_heads
     print(f"    n_heads={n_heads}, d_head={d // n_heads}")
     print(f"    built in {time.time()-t0:.1f}s")
     return embeddings, Wq_init, Wk_init, d, n_heads
@@ -127,6 +123,9 @@ class StatTransformer:
             self.W1_layers.append(W1)
             self.W2_layers.append(W2)
 
+        self.dropout_p = 0.1
+        self.training = False
+
         print(f"    d={d}, n_heads={n_heads}, d_head={self.d_head}, layers={n_layers}, d_ff={d_ff}")
 
     def _attention(self, Q, K, V, causal, pad_mask):
@@ -168,10 +167,15 @@ class StatTransformer:
             Q = x @ Wq_list[l]
             K = x @ Wk_list[l]
             attn_out = self._attention(Q, K, x, causal, p_mask)
+            if self.training:
+                attn_out = F.dropout(attn_out, p=self.dropout_p)
             x = _layer_norm(x + attn_out)
 
             # FFN: ReLU(x @ W1) @ W2
-            ffn_out = F.relu(x @ W1_list[l]) @ W2_list[l]
+            ffn_h = F.relu(x @ W1_list[l])
+            if self.training:
+                ffn_h = F.dropout(ffn_h, p=self.dropout_p)
+            ffn_out = ffn_h @ W2_list[l]
             x = _layer_norm(x + ffn_out)
 
         return x[:, -1, :] @ E.T / math.sqrt(self.d)
@@ -196,7 +200,7 @@ class StatTransformer:
         W1_p = [w.clone().detach().requires_grad_(True) for w in self.W1_layers]
         W2_p = [w.clone().detach().requires_grad_(True) for w in self.W2_layers]
         all_params = [E_p] + Wq_p + Wk_p + W1_p + W2_p
-        optimizer = torch.optim.Adam(all_params, lr=lr)
+        optimizer = torch.optim.Adam(all_params, lr=lr, weight_decay=0.01)
 
         # Training data
         train_ctx, train_tgt = [], []
@@ -224,6 +228,7 @@ class StatTransformer:
         n_val = len(val_ctx)
         if n_train == 0:
             return
+        self.training = True
         indices = list(range(n_train))
         best_val_ppl = float('inf')
         no_improve = 0
@@ -251,7 +256,8 @@ class StatTransformer:
 
             train_ppl = math.exp(total_loss / max(n_batches, 1))
 
-            # Validation PPL (the REAL measure)
+            # Validation PPL (dropout off)
+            self.training = False
             with torch.no_grad():
                 val_loss = 0.0
                 for vs in range(0, n_val, batch_size):
@@ -261,6 +267,7 @@ class StatTransformer:
                     vlogits = self._forward_logits(vctx, E_p, Wq_p, Wk_p, W1_p, W2_p)
                     val_loss += F.cross_entropy(vlogits, vtgt).item() * (ve - vs)
                 val_ppl = math.exp(val_loss / max(n_val, 1))
+            self.training = True
 
             tag = "↓" if val_ppl < best_val_ppl else "↑"
             print(f"    epoch {epoch}: train={train_ppl:.1f} val={val_ppl:.1f} {tag}")
@@ -281,6 +288,7 @@ class StatTransformer:
                     print(f"    early stop at epoch {epoch} (best val={best_val_ppl:.1f})")
                     break
 
+        self.training = False
         if best_state:
             self.embeddings = best_state["E"]
             self.Wq_layers = best_state["Wq"]
