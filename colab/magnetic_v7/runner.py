@@ -84,9 +84,21 @@ def _cache_key(cfg, n_train, V):
 
 
 def _try_load_cache(cache_dir, key):
-    """Load cached spectrum if available."""
-    path = os.path.join(cache_dir, f"spectrum_{key}.pt")
-    if os.path.exists(path):
+    """Load cached spectrum. Search: code dir → cache dir."""
+    fname = f"spectrum_{key}.pt"
+    # Search in code directory first, then cache_dir
+    code_dir = os.path.dirname(os.path.abspath(__file__))
+    search_paths = [
+        os.path.join(code_dir, fname),
+        os.path.join(code_dir, "cache", fname),
+        os.path.join(cache_dir, fname),
+    ]
+    path = None
+    for p in search_paths:
+        if os.path.exists(p):
+            path = p
+            break
+    if path:
         try:
             data = torch.load(path, map_location="cpu", weights_only=False)
             print(f"  ✓ Loaded from cache: {path}")
@@ -240,8 +252,7 @@ def run_pipeline(cfg: Config) -> Dict:
     if cfg.refine:
         print(f"Refining ALL weights (early stopping, patience=3)...")
         t0 = time.time()
-        transformer.refine(enc_train)
-        print(f"  refined in {time.time()-t0:.1f}s")
+        transformer.refine(enc_train, enc_valid)
         print(f"  refined in {time.time()-t0:.1f}s")
 
     # ══════════════════════════════════════════════════════════════

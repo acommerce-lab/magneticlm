@@ -187,8 +187,9 @@ class StatTransformer:
     def score_single(self, context_ids):
         return self.score_batch([context_ids])[0]
 
-    def refine(self, encoded, lr=0.001, batch_size=64, max_epochs=100, patience=5):
-        """Train ALL weights: E, Wq, Wk, W1, W2 with early stopping."""
+    def refine(self, enc_train, enc_valid, lr=0.001, batch_size=64,
+               max_epochs=100, patience=5):
+        """Train ALL weights with validation-based early stopping."""
         E_p = self.embeddings.clone().detach().requires_grad_(True)
         Wq_p = [w.clone().detach().requires_grad_(True) for w in self.Wq_layers]
         Wk_p = [w.clone().detach().requires_grad_(True) for w in self.Wk_layers]
@@ -197,33 +198,47 @@ class StatTransformer:
         all_params = [E_p] + Wq_p + Wk_p + W1_p + W2_p
         optimizer = torch.optim.Adam(all_params, lr=lr)
 
-        all_ctx, all_tgt = [], []
-        for arr in encoded:
+        # Training data
+        train_ctx, train_tgt = [], []
+        for arr in enc_train:
             if arr.size < 2:
                 continue
             ids = arr.astype(np.int64)
             for i in range(len(ids) - 1):
                 ctx = ids[max(0, i - self.context_len):i + 1].tolist()
-                all_ctx.append(ctx)
-                all_tgt.append(int(ids[i + 1]))
+                train_ctx.append(ctx)
+                train_tgt.append(int(ids[i + 1]))
 
-        n_total = len(all_ctx)
-        if n_total == 0:
+        # Validation data (for early stopping)
+        val_ctx, val_tgt = [], []
+        for arr in enc_valid:
+            if arr.size < 2:
+                continue
+            ids = arr.astype(np.int64)
+            for i in range(min(len(ids) - 1, 5000)):
+                ctx = ids[max(0, i - self.context_len):i + 1].tolist()
+                val_ctx.append(ctx)
+                val_tgt.append(int(ids[i + 1]))
+
+        n_train = len(train_ctx)
+        n_val = len(val_ctx)
+        if n_train == 0:
             return
-        indices = list(range(n_total))
-        best_ppl = float('inf')
+        indices = list(range(n_train))
+        best_val_ppl = float('inf')
         no_improve = 0
         best_state = None
 
         for epoch in range(max_epochs):
+            # Train
             np.random.shuffle(indices)
             total_loss, n_batches = 0.0, 0
 
-            for start in range(0, n_total, batch_size):
-                end = min(start + batch_size, n_total)
+            for start in range(0, n_train, batch_size):
+                end = min(start + batch_size, n_train)
                 batch_idx = indices[start:end]
-                batch_ctx = [all_ctx[i] for i in batch_idx]
-                batch_tgt = torch.tensor([all_tgt[i] for i in batch_idx],
+                batch_ctx = [train_ctx[i] for i in batch_idx]
+                batch_tgt = torch.tensor([train_tgt[i] for i in batch_idx],
                                          dtype=torch.long, device=self.device)
 
                 optimizer.zero_grad()
@@ -234,12 +249,24 @@ class StatTransformer:
                 total_loss += loss.item()
                 n_batches += 1
 
-            ppl = math.exp(total_loss / max(n_batches, 1))
-            tag = "↓" if ppl < best_ppl else "↑"
-            print(f"    epoch {epoch}: PPL={ppl:.1f} {tag}")
+            train_ppl = math.exp(total_loss / max(n_batches, 1))
 
-            if ppl < best_ppl:
-                best_ppl = ppl
+            # Validation PPL (the REAL measure)
+            with torch.no_grad():
+                val_loss = 0.0
+                for vs in range(0, n_val, batch_size):
+                    ve = min(vs + batch_size, n_val)
+                    vctx = val_ctx[vs:ve]
+                    vtgt = torch.tensor(val_tgt[vs:ve], dtype=torch.long, device=self.device)
+                    vlogits = self._forward_logits(vctx, E_p, Wq_p, Wk_p, W1_p, W2_p)
+                    val_loss += F.cross_entropy(vlogits, vtgt).item() * (ve - vs)
+                val_ppl = math.exp(val_loss / max(n_val, 1))
+
+            tag = "↓" if val_ppl < best_val_ppl else "↑"
+            print(f"    epoch {epoch}: train={train_ppl:.1f} val={val_ppl:.1f} {tag}")
+
+            if val_ppl < best_val_ppl:
+                best_val_ppl = val_ppl
                 no_improve = 0
                 best_state = {
                     "E": E_p.detach().clone(),
@@ -251,7 +278,7 @@ class StatTransformer:
             else:
                 no_improve += 1
                 if no_improve >= patience:
-                    print(f"    early stop at epoch {epoch} (best={best_ppl:.1f})")
+                    print(f"    early stop at epoch {epoch} (best val={best_val_ppl:.1f})")
                     break
 
         if best_state:
