@@ -247,21 +247,14 @@ def run_pipeline(cfg: Config) -> Dict:
     transformer.init_from_spectrum(embeddings, Wq, Wk)
     transformer = transformer.to(device)
 
-    # Multi-GPU: wrap with DataParallel
-    if res.multi_gpu and len(res.gpu_ids) > 1:
-        transformer = torch.nn.DataParallel(transformer, device_ids=res.gpu_ids)
-        print(f"    DataParallel on GPUs: {res.gpu_ids}")
-
     # Optional refinement
     if cfg.refine:
         print(f"Refining ALL weights (early stopping, patience=5)...")
         t0 = time.time()
-        base_model = transformer.module if hasattr(transformer, 'module') else transformer
-        train_model(base_model, enc_train, enc_valid, cfg.context_len)
+        train_model(transformer, enc_train, enc_valid, cfg.context_len)
         print(f"  refined in {time.time()-t0:.1f}s")
 
-    # Unwrap for eval
-    eval_model = transformer.module if hasattr(transformer, 'module') else transformer
+    eval_model = transformer
     eval_model.eval()
 
     # ══════════════════════════════════════════════════════════════

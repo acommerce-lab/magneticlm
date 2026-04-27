@@ -222,10 +222,14 @@ def train_model(model, train_data, val_data, context_len,
     train_ds = LMDataset(train_data, context_len)
     val_ds = LMDataset(val_data, context_len)
 
-    # Subsample if too large
+    # Subsample both if too large
     if len(train_ds) > max_samples:
         indices = torch.randperm(len(train_ds))[:max_samples].tolist()
         train_ds = torch.utils.data.Subset(train_ds, indices)
+    val_max = min(len(val_ds), 10000)
+    if len(val_ds) > val_max:
+        val_ds = torch.utils.data.Subset(val_ds,
+            torch.randperm(len(val_ds))[:val_max].tolist())
 
     use_cuda = device.type == 'cuda'
     train_loader = torch.utils.data.DataLoader(
