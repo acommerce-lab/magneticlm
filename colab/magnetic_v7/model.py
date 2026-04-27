@@ -276,7 +276,7 @@ class StatTransformer:
                     ffn_h = F.dropout(ffn_h, p=self.dropout_p)
                 x = _layer_norm(x + ffn_h @ W2_list[l])
             if x.device != E.device:
-            x = x.to(E.device)
+                x = x.to(E.device)
         return x[:, -1, :] @ E.T / math.sqrt(self.d)
 
         for epoch in range(max_epochs):
