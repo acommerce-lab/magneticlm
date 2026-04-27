@@ -285,12 +285,15 @@ class StatTransformer:
                 x = x.to(E.device)
             return x[:, -1, :] @ E.T / math.sqrt(self.d)
 
+        # Limit samples per epoch for speed (subsample if too large)
+        max_samples_per_epoch = min(n_train, 50000)
+
         for epoch in range(max_epochs):
-            perm = torch.randperm(n_train, device=self.device)
+            perm = torch.randperm(n_train, device=self.device)[:max_samples_per_epoch]
             total_loss, n_batches = 0.0, 0
 
-            for start in range(0, n_train, batch_size):
-                end = min(start + batch_size, n_train)
+            for start in range(0, max_samples_per_epoch, batch_size):
+                end = min(start + batch_size, max_samples_per_epoch)
                 idx = perm[start:end]
                 batch_ctx = train_ctx_t[idx]
                 batch_tgt = train_tgt_t[idx]
