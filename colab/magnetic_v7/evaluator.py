@@ -4,7 +4,7 @@ import math, time
 import numpy as np
 import torch
 
-from .model import _decay_cache
+from .model import decay_cache as _decay_cache
 
 OOD_CLOZE = [
     ("the king ruled the", "kingdom"),

@@ -7,7 +7,7 @@ import numpy as np, torch
 
 from .config import Config
 from .data import load_dataset
-from .model import build_all_from_spectrum, StatTransformer
+from .model import build_all_from_spectrum, StatTransformer, train_model
 from .evaluator import eval_layers, eval_ood
 from .resources import Monitor, detect, setup_cuda_tuning
 from .stats import build_stats
@@ -236,28 +236,33 @@ def run_pipeline(cfg: Config) -> Dict:
         mon.snapshot("after-spectrum")
 
     # ══════════════════════════════════════════════════════════════
-    # ASSEMBLE TRANSFORMER
+    # ASSEMBLE TRANSFORMER (nn.Module — works on any device)
     # ══════════════════════════════════════════════════════════════
-    devices = [res.primary_device]
-    if res.multi_gpu and len(res.gpu_ids) > 1:
-        devices = [torch.device(f"cuda:{i}") for i in res.gpu_ids]
-    print(f"Assembling StatTransformer (d={d}, L={n_layers}, device={res.primary_device})...")
+    device = res.primary_device
+    print(f"Assembling StatTransformer (d={d}, L={n_layers}, device={device})...")
     transformer = StatTransformer(
-        embeddings=embeddings,
-        Wq_init=Wq, Wk_init=Wk,
-        n_heads=n_heads,
-        n_layers=n_layers,
-        context_len=cfg.context_len,
-        pos_decay=cfg.pos_decay,
-        devices=devices,
+        V=V, d=d, n_heads=n_heads, n_layers=n_layers,
+        context_len=cfg.context_len, pos_decay=cfg.pos_decay,
     )
+    transformer.init_from_spectrum(embeddings, Wq, Wk)
+    transformer = transformer.to(device)
 
-    # Optional refinement (early stopping)
+    # Multi-GPU: wrap with DataParallel
+    if res.multi_gpu and len(res.gpu_ids) > 1:
+        transformer = torch.nn.DataParallel(transformer, device_ids=res.gpu_ids)
+        print(f"    DataParallel on GPUs: {res.gpu_ids}")
+
+    # Optional refinement
     if cfg.refine:
-        print(f"Refining ALL weights (early stopping, patience=3)...")
+        print(f"Refining ALL weights (early stopping, patience=5)...")
         t0 = time.time()
-        transformer.refine(enc_train, enc_valid)
+        base_model = transformer.module if hasattr(transformer, 'module') else transformer
+        train_model(base_model, enc_train, enc_valid, cfg.context_len)
         print(f"  refined in {time.time()-t0:.1f}s")
+
+    # Unwrap for eval
+    eval_model = transformer.module if hasattr(transformer, 'module') else transformer
+    eval_model.eval()
 
     # ══════════════════════════════════════════════════════════════
     # EVALUATION
@@ -273,11 +278,11 @@ def run_pipeline(cfg: Config) -> Dict:
     }
 
     print("  [eval] Layer diagnostics...")
-    results["layers"] = eval_layers(transformer, V, enc_valid, cfg, res.primary_device)
+    results["layers"] = eval_layers(eval_model, V, enc_valid, cfg, res.primary_device)
 
     if cfg.eval_ood_cloze:
         print("  [eval] OOD cloze...")
-        results["ood"] = eval_ood(transformer, V, vocab, cfg, res.primary_device)
+        results["ood"] = eval_ood(eval_model, V, vocab, cfg, res.primary_device)
 
     layers = results.get("layers", {})
     if layers:

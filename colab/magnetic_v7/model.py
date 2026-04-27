@@ -1,22 +1,19 @@
-"""v7 — Statistical Transformer (Full Training Match).
+"""v7 — Statistical Transformer as nn.Module.
 
-Matches standard transformer:
-  - Per-layer Wq_l, Wk_l (separate per layer)
-  - Trainable FFN (W1, W2 per layer)
-  - d constant, multi-head attention
-  - All weights trainable with early stopping
-  - No sample cap, max_epochs=100
+Works on any device: CPU, GPU, multi-GPU, TPU.
+Uses standard PyTorch nn.Module for automatic device handling.
 """
 
 import math, time
-from typing import Dict, List
+from typing import List
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 
 # ======================================================================
-# 1. Build spectrum
+# 1. Build spectrum (unchanged)
 # ======================================================================
 
 def build_all_from_spectrum(ctx_rows, ctx_cols, ctx_counts, unigram,
@@ -50,7 +47,6 @@ def build_all_from_spectrum(ctx_rows, ctx_cols, ctx_counts, unigram,
     print(f"    cumvar: {cumvar[d-1]:.1%} at d={d} (target={var_target:.0%})")
 
     embeddings = (U_full[:, :d] * S_full[:d].sqrt().unsqueeze(0)).to(device)
-    print(f"    embeddings [{V}x{d}]")
 
     TE = torch.sparse.mm(bg_trans.cpu(), embeddings.cpu()).to(device)
     M_embed = embeddings.T @ TE
@@ -58,28 +54,240 @@ def build_all_from_spectrum(ctx_rows, ctx_cols, ctx_counts, unigram,
     Wq_init = U_m.contiguous()
     Wk_init = Vh_m.T.contiguous()
 
-    # Auto n_heads: find best divisor of d in range [2, 16]
+    # Auto n_heads
     best_heads = 1
     for h in [2, 3, 4, 6, 7, 8, 12, 16]:
         if d % h == 0 and h <= d // 2:
             best_heads = h
     n_heads = best_heads
-    print(f"    n_heads={n_heads}, d_head={d // n_heads}")
+    print(f"    d={d}, n_heads={n_heads}, d_head={d // n_heads}")
     print(f"    built in {time.time()-t0:.1f}s")
     return embeddings, Wq_init, Wk_init, d, n_heads
 
 
 # ======================================================================
-# 2. Statistical Transformer
+# 2. Transformer Layer as nn.Module
 # ======================================================================
 
-def _layer_norm(x, eps=1e-5):
-    mean = x.mean(dim=-1, keepdim=True)
-    var = x.var(dim=-1, keepdim=True, unbiased=False)
-    return (x - mean) / (var + eps).sqrt()
+class TransformerLayer(nn.Module):
+    def __init__(self, d, n_heads, d_ff, dropout=0.1):
+        super().__init__()
+        self.n_heads = n_heads
+        self.d_head = d // n_heads
+        self.Wq = nn.Linear(d, d, bias=False)
+        self.Wk = nn.Linear(d, d, bias=False)
+        self.W1 = nn.Linear(d, d_ff, bias=False)
+        self.W2 = nn.Linear(d_ff, d, bias=False)
+        self.norm1 = nn.LayerNorm(d)
+        self.norm2 = nn.LayerNorm(d)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, causal_mask, pad_mask):
+        # Multi-head attention
+        B, S, D = x.shape
+        H, d_h = self.n_heads, self.d_head
+        Q = self.Wq(x).view(B, S, H, d_h).transpose(1, 2)
+        K = self.Wk(x).view(B, S, H, d_h).transpose(1, 2)
+        V = x.view(B, S, H, d_h).transpose(1, 2)
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(d_h)
+        scores = scores.masked_fill(~causal_mask.unsqueeze(0).unsqueeze(0), -1e9)
+        scores = scores.masked_fill(~pad_mask.unsqueeze(1), -1e9)
+        attn = self.dropout(F.softmax(scores, dim=-1))
+        out = torch.matmul(attn, V).transpose(1, 2).contiguous().view(B, S, D)
+        x = self.norm1(x + self.dropout(out))
+        # FFN
+        ffn = self.W2(self.dropout(F.relu(self.W1(x))))
+        x = self.norm2(x + self.dropout(ffn))
+        return x
 
 
-def _decay_cache(history, V, device):
+# ======================================================================
+# 3. Full Model as nn.Module
+# ======================================================================
+
+class StatTransformer(nn.Module):
+    def __init__(self, V, d, n_heads, n_layers, context_len=8,
+                 pos_decay=0.1, dropout=0.1):
+        super().__init__()
+        self.V = V
+        self.d = d
+        self.n_layers = n_layers
+        self.context_len = context_len
+        self.pos_decay = pos_decay
+
+        self.embedding = nn.Embedding(V, d)
+        self.layers = nn.ModuleList([
+            TransformerLayer(d, n_heads, 4 * d, dropout)
+            for _ in range(n_layers)
+        ])
+        self.out_norm = nn.LayerNorm(d)
+        print(f"    d={d}, n_heads={n_heads}, d_head={d//n_heads}, "
+              f"layers={n_layers}, d_ff={4*d}, params={sum(p.numel() for p in self.parameters()):,}")
+
+    def init_from_spectrum(self, embeddings, Wq_init, Wk_init):
+        """Initialize weights from spectral decomposition."""
+        with torch.no_grad():
+            self.embedding.weight.copy_(embeddings)
+            E_norm = embeddings / embeddings.norm(dim=1, keepdim=True).clamp(min=1e-9)
+            d_ff = 4 * self.d
+            for layer in self.layers:
+                layer.Wq.weight.copy_(Wq_init)
+                layer.Wk.weight.copy_(Wk_init)
+                if self.V >= d_ff:
+                    layer.W1.weight.copy_(E_norm[:d_ff, :])
+                    layer.W2.weight.copy_(embeddings[:d_ff, :].T)
+
+    def forward(self, input_ids, pad_mask=None):
+        B, S = input_ids.shape
+        device = input_ids.device
+
+        x = self.embedding(input_ids)
+        pos = torch.arange(S, dtype=torch.float32, device=device)
+        pw = torch.exp(-self.pos_decay * (S - 1 - pos))
+        x = x * pw.unsqueeze(0).unsqueeze(-1)
+        if pad_mask is not None:
+            x = x * pad_mask.unsqueeze(-1).float()
+
+        causal = torch.tril(torch.ones(S, S, device=device, dtype=torch.bool))
+        p_mask = pad_mask.unsqueeze(1) if pad_mask is not None else \
+                 torch.ones(B, 1, S, device=device, dtype=torch.bool)
+
+        for layer in self.layers:
+            x = layer(x, causal, p_mask)
+
+        x = self.out_norm(x)
+        logits = x[:, -1, :] @ self.embedding.weight.T / math.sqrt(self.d)
+        return logits
+
+    def score_batch(self, contexts):
+        cl = self.context_len
+        trimmed = [c[-cl:] for c in contexts]
+        max_len = max(len(c) for c in trimmed) if trimmed else 1
+        device = self.embedding.weight.device
+
+        padded = torch.zeros(len(trimmed), max_len, dtype=torch.long, device=device)
+        pad_mask = torch.zeros(len(trimmed), max_len, dtype=torch.bool, device=device)
+        for i, c in enumerate(trimmed):
+            L = len(c)
+            padded[i, max_len - L:] = torch.tensor(c, dtype=torch.long, device=device)
+            pad_mask[i, max_len - L:] = True
+
+        with torch.no_grad():
+            logits = self.forward(padded, pad_mask)
+            return F.softmax(logits, dim=1)
+
+    def score_single(self, context_ids):
+        return self.score_batch([context_ids])[0]
+
+
+# ======================================================================
+# 4. Training with DataLoader
+# ======================================================================
+
+class LMDataset(torch.utils.data.Dataset):
+    def __init__(self, encoded, context_len):
+        self.pairs = []
+        for arr in encoded:
+            if arr.size < 2:
+                continue
+            ids = arr.astype(np.int64)
+            for i in range(len(ids) - 1):
+                ctx = ids[max(0, i - context_len):i + 1]
+                # Pad to context_len + 1
+                padded = np.zeros(context_len + 1, dtype=np.int64)
+                padded[context_len + 1 - len(ctx):] = ctx
+                self.pairs.append((padded, int(ids[i + 1])))
+
+    def __len__(self):
+        return len(self.pairs)
+
+    def __getitem__(self, idx):
+        ctx, tgt = self.pairs[idx]
+        return torch.tensor(ctx, dtype=torch.long), torch.tensor(tgt, dtype=torch.long)
+
+
+def train_model(model, train_data, val_data, context_len,
+                lr=0.001, batch_size=512, max_epochs=100, patience=5,
+                max_samples=50000):
+    """Train with DataLoader — works on any device."""
+    device = next(model.parameters()).device
+
+    train_ds = LMDataset(train_data, context_len)
+    val_ds = LMDataset(val_data, context_len)
+
+    # Subsample if too large
+    if len(train_ds) > max_samples:
+        indices = torch.randperm(len(train_ds))[:max_samples].tolist()
+        train_ds = torch.utils.data.Subset(train_ds, indices)
+
+    train_loader = torch.utils.data.DataLoader(
+        train_ds, batch_size=batch_size, shuffle=True,
+        num_workers=0, pin_memory=True)
+    val_loader = torch.utils.data.DataLoader(
+        val_ds, batch_size=batch_size, shuffle=False,
+        num_workers=0, pin_memory=True)
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=0.01)
+    best_val_ppl = float('inf')
+    no_improve = 0
+    best_state = None
+
+    print(f"    train={len(train_ds):,} val={len(val_ds):,} batch={batch_size}")
+
+    for epoch in range(max_epochs):
+        # Train
+        model.train()
+        total_loss, n_batches = 0.0, 0
+        for ctx_batch, tgt_batch in train_loader:
+            ctx_batch = ctx_batch.to(device)
+            tgt_batch = tgt_batch.to(device)
+            pad_mask = ctx_batch > 0
+
+            optimizer.zero_grad()
+            logits = model(ctx_batch, pad_mask)
+            loss = F.cross_entropy(logits, tgt_batch)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+            n_batches += 1
+
+        train_ppl = math.exp(total_loss / max(n_batches, 1))
+
+        # Validate
+        model.eval()
+        with torch.no_grad():
+            val_loss, val_n = 0.0, 0
+            for ctx_batch, tgt_batch in val_loader:
+                ctx_batch = ctx_batch.to(device)
+                tgt_batch = tgt_batch.to(device)
+                pad_mask = ctx_batch > 0
+                logits = model(ctx_batch, pad_mask)
+                val_loss += F.cross_entropy(logits, tgt_batch).item() * ctx_batch.shape[0]
+                val_n += ctx_batch.shape[0]
+            val_ppl = math.exp(val_loss / max(val_n, 1))
+
+        tag = "↓" if val_ppl < best_val_ppl else "↑"
+        print(f"    epoch {epoch}: train={train_ppl:.1f} val={val_ppl:.1f} {tag}")
+
+        if val_ppl < best_val_ppl:
+            best_val_ppl = val_ppl
+            no_improve = 0
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+        else:
+            no_improve += 1
+            if no_improve >= patience:
+                print(f"    early stop at epoch {epoch} (best val={best_val_ppl:.1f})")
+                break
+
+    if best_state:
+        model.load_state_dict({k: v.to(device) for k, v in best_state.items()})
+
+
+# ======================================================================
+# 5. Cache helper
+# ======================================================================
+
+def decay_cache(history, V, device):
     if len(history) < 2:
         return torch.zeros(V, dtype=torch.float32, device=device)
     h = torch.tensor(history, dtype=torch.int64, device=device)
@@ -88,261 +296,3 @@ def _decay_cache(history, V, device):
     b.scatter_add_(0, h, 1.0 / torch.log(2.0 + ages))
     s = b.sum()
     return b / s if s > 1e-9 else b
-
-
-class StatTransformer:
-    def __init__(self, embeddings, Wq_init, Wk_init, n_heads,
-                 n_layers=2, context_len=8, pos_decay=0.1, devices=None):
-        self.device = embeddings.device
-        self.devices = devices or [self.device]
-        self.V, self.d = embeddings.shape
-        self.n_layers = n_layers
-        self.n_heads = n_heads
-        self.d_head = self.d // n_heads
-        self.context_len = context_len
-        self.pos_decay = pos_decay
-        d = self.d
-
-        self.embeddings = embeddings.clone()
-        # Distribute layers across GPUs
-        self.layer_devices = []
-        for l in range(n_layers):
-            dev = self.devices[l % len(self.devices)]
-            self.layer_devices.append(dev)
-        self.Wq_layers = [Wq_init.clone().to(self.layer_devices[l]) for l in range(n_layers)]
-        self.Wk_layers = [Wk_init.clone().to(self.layer_devices[l]) for l in range(n_layers)]
-        # Keep copies of E on each device
-        self.E_per_device = {self.device: self.embeddings}
-        for dev in self.devices:
-            if dev != self.device:
-                self.E_per_device[dev] = self.embeddings.to(dev)
-
-        # FFN: W1 [d, 4d], W2 [4d, d] per layer — initialized from statistics
-        d_ff = 4 * d
-        self.W1_layers = []
-        self.W2_layers = []
-        E_norm = embeddings / embeddings.norm(dim=1, keepdim=True).clamp(min=1e-9)
-        for l in range(n_layers):
-            dev = self.layer_devices[l]
-            if self.V >= d_ff:
-                W1 = E_norm[:d_ff, :].T.contiguous().to(dev)
-                W2 = embeddings[:d_ff, :].contiguous().to(dev)
-            else:
-                W1 = torch.randn(d, d_ff, device=dev) * 0.02
-                W2 = torch.randn(d_ff, d, device=dev) * 0.02
-            self.W1_layers.append(W1)
-            self.W2_layers.append(W2)
-
-        self.dropout_p = 0.1
-        self.training = False
-
-        print(f"    d={d}, n_heads={n_heads}, d_head={self.d_head}, layers={n_layers}, d_ff={d_ff}")
-
-    def _attention(self, Q, K, V, causal, pad_mask):
-        B, S, D = Q.shape
-        H, d_h = self.n_heads, self.d_head
-        Qh = Q.view(B, S, H, d_h).transpose(1, 2)
-        Kh = K.view(B, S, H, d_h).transpose(1, 2)
-        Vh = V.view(B, S, H, d_h).transpose(1, 2)
-        scores = torch.matmul(Qh, Kh.transpose(-2, -1)) / math.sqrt(d_h)
-        scores = scores.masked_fill(~causal.unsqueeze(0).unsqueeze(0), -1e9)
-        scores = scores.masked_fill(~pad_mask.unsqueeze(1), -1e9)
-        attn_w = F.softmax(scores, dim=-1)
-        out = torch.matmul(attn_w, Vh)
-        return out.transpose(1, 2).contiguous().view(B, S, D)
-
-    def _forward_logits(self, contexts, E, Wq_list, Wk_list, W1_list, W2_list):
-        n = len(contexts)
-        cl = self.context_len
-        trimmed = [c[-cl:] for c in contexts]
-        max_len = max(len(c) for c in trimmed) if trimmed else 1
-
-        padded = torch.zeros(n, max_len, dtype=torch.long, device=self.device)
-        pad_mask = torch.zeros(n, max_len, dtype=torch.bool, device=self.device)
-        for i, c in enumerate(trimmed):
-            L = len(c)
-            padded[i, max_len - L:] = torch.tensor(c, dtype=torch.long, device=self.device)
-            pad_mask[i, max_len - L:] = True
-
-        S = max_len
-        x = E[padded]
-        pos = torch.arange(S, dtype=torch.float32, device=self.device)
-        pw = torch.exp(-self.pos_decay * (S - 1 - pos))
-        x = x * pw.unsqueeze(0).unsqueeze(-1) * pad_mask.unsqueeze(-1).float()
-
-        causal = torch.tril(torch.ones(S, S, device=self.device, dtype=torch.bool))
-        p_mask = pad_mask.unsqueeze(1)
-
-        for l in range(self.n_layers):
-            dev = Wq_list[l].device
-            if x.device != dev:
-                x = x.to(dev)
-                causal = causal.to(dev)
-                p_mask = p_mask.to(dev)
-            Q = x @ Wq_list[l]
-            K = x @ Wk_list[l]
-            attn_out = self._attention(Q, K, x, causal, p_mask)
-            if self.training:
-                attn_out = F.dropout(attn_out, p=self.dropout_p)
-            x = _layer_norm(x + attn_out)
-            ffn_h = F.relu(x @ W1_list[l])
-            if self.training:
-                ffn_h = F.dropout(ffn_h, p=self.dropout_p)
-            x = _layer_norm(x + ffn_h @ W2_list[l])
-
-        if x.device != E.device:
-            x = x.to(E.device)
-        return x[:, -1, :] @ E.T / math.sqrt(self.d)
-
-    def score_batch(self, contexts):
-        with torch.no_grad():
-            logits = self._forward_logits(
-                contexts, self.embeddings,
-                self.Wq_layers, self.Wk_layers,
-                self.W1_layers, self.W2_layers)
-            return F.softmax(logits, dim=1)
-
-    def score_single(self, context_ids):
-        return self.score_batch([context_ids])[0]
-
-    def refine(self, enc_train, enc_valid, lr=0.001, batch_size=512,
-               max_epochs=100, patience=5):
-        """Train ALL weights with validation-based early stopping."""
-        E_p = self.embeddings.clone().detach().requires_grad_(True)
-        Wq_p = [w.clone().detach().requires_grad_(True) for w in self.Wq_layers]
-        Wk_p = [w.clone().detach().requires_grad_(True) for w in self.Wk_layers]
-        W1_p = [w.clone().detach().requires_grad_(True) for w in self.W1_layers]
-        W2_p = [w.clone().detach().requires_grad_(True) for w in self.W2_layers]
-        all_params = [E_p] + Wq_p + Wk_p + W1_p + W2_p
-        optimizer = torch.optim.Adam(all_params, lr=lr, weight_decay=0.01)
-
-        # Pre-tensorize training data on GPU
-        cl = self.context_len
-        def _build_pairs(encoded, max_samples=0):
-            all_ids = []
-            for arr in encoded:
-                if arr.size < 2:
-                    continue
-                all_ids.append(arr.astype(np.int64))
-            if not all_ids:
-                return None, None
-            flat = np.concatenate(all_ids)
-            n = len(flat) - 1
-            if max_samples > 0:
-                n = min(n, max_samples)
-            # Build padded context tensor [n, cl+1] and target [n]
-            ctx_t = torch.zeros(n, cl + 1, dtype=torch.long, device=self.device)
-            tgt_t = torch.zeros(n, dtype=torch.long, device=self.device)
-            for i in range(n):
-                start = max(0, i - cl)
-                ctx = flat[start:i + 1]
-                ctx_t[i, cl + 1 - len(ctx):] = torch.tensor(ctx, dtype=torch.long)
-                tgt_t[i] = int(flat[i + 1])
-            return ctx_t, tgt_t
-
-        print(f"    preparing data on {self.device}...")
-        train_ctx_t, train_tgt_t = _build_pairs(enc_train)
-        val_ctx_t, val_tgt_t = _build_pairs(enc_valid, max_samples=5000)
-
-        if train_ctx_t is None:
-            return
-        n_train = train_ctx_t.shape[0]
-        n_val = val_ctx_t.shape[0] if val_ctx_t is not None else 0
-        self.training = True
-        best_val_ppl = float('inf')
-        no_improve = 0
-        best_state = None
-        print(f"    train={n_train:,} val={n_val:,} samples, batch={batch_size}")
-
-        def _forward_tensor(ctx_padded, E, Wq_list, Wk_list, W1_list, W2_list):
-            """Forward on pre-padded tensor. All on same device."""
-            dev = E.device
-            pad_mask = ctx_padded.to(dev) > 0
-            x = E[ctx_padded.to(dev)]
-            S = x.shape[1]
-            pos = torch.arange(S, dtype=torch.float32, device=dev)
-            pw = torch.exp(-self.pos_decay * (S - 1 - pos))
-            x = x * pw.unsqueeze(0).unsqueeze(-1) * pad_mask.unsqueeze(-1).float()
-            causal = torch.tril(torch.ones(S, S, device=dev, dtype=torch.bool))
-            p_mask = pad_mask.unsqueeze(1)
-            for l in range(self.n_layers):
-                ldev = Wq_list[l].device
-                if x.device != ldev:
-                    x = x.to(ldev)
-                    causal = causal.to(ldev)
-                    p_mask = p_mask.to(ldev)
-                Q = x @ Wq_list[l]
-                K = x @ Wk_list[l]
-                attn_out = self._attention(Q, K, x, causal, p_mask)
-                if self.training:
-                    attn_out = F.dropout(attn_out, p=self.dropout_p)
-                x = _layer_norm(x + attn_out)
-                ffn_h = F.relu(x @ W1_list[l])
-                if self.training:
-                    ffn_h = F.dropout(ffn_h, p=self.dropout_p)
-                x = _layer_norm(x + ffn_h @ W2_list[l])
-            if x.device != E.device:
-                x = x.to(E.device)
-            return x[:, -1, :] @ E.T / math.sqrt(self.d)
-
-        # Limit samples per epoch for speed (subsample if too large)
-        max_samples_per_epoch = min(n_train, 50000)
-
-        for epoch in range(max_epochs):
-            perm = torch.randperm(n_train, device=self.device)[:max_samples_per_epoch]
-            total_loss, n_batches = 0.0, 0
-
-            for start in range(0, max_samples_per_epoch, batch_size):
-                end = min(start + batch_size, max_samples_per_epoch)
-                idx = perm[start:end]
-                batch_ctx = train_ctx_t[idx]
-                batch_tgt = train_tgt_t[idx]
-
-                optimizer.zero_grad()
-                logits = _forward_tensor(batch_ctx, E_p, Wq_p, Wk_p, W1_p, W2_p)
-                loss = F.cross_entropy(logits, batch_tgt)
-                loss.backward()
-                optimizer.step()
-                total_loss += loss.item()
-                n_batches += 1
-
-            train_ppl = math.exp(total_loss / max(n_batches, 1))
-
-            # Validation PPL (dropout off)
-            self.training = False
-            with torch.no_grad():
-                val_loss = 0.0
-                for vs in range(0, n_val, batch_size):
-                    ve = min(vs + batch_size, n_val)
-                    vlogits = _forward_tensor(
-                        val_ctx_t[vs:ve], E_p, Wq_p, Wk_p, W1_p, W2_p)
-                    val_loss += F.cross_entropy(vlogits, val_tgt_t[vs:ve]).item() * (ve - vs)
-                val_ppl = math.exp(val_loss / max(n_val, 1))
-            self.training = True
-
-            tag = "↓" if val_ppl < best_val_ppl else "↑"
-            print(f"    epoch {epoch}: train={train_ppl:.1f} val={val_ppl:.1f} {tag}")
-
-            if val_ppl < best_val_ppl:
-                best_val_ppl = val_ppl
-                no_improve = 0
-                best_state = {
-                    "E": E_p.detach().clone(),
-                    "Wq": [w.detach().clone() for w in Wq_p],
-                    "Wk": [w.detach().clone() for w in Wk_p],
-                    "W1": [w.detach().clone() for w in W1_p],
-                    "W2": [w.detach().clone() for w in W2_p],
-                }
-            else:
-                no_improve += 1
-                if no_improve >= patience:
-                    print(f"    early stop at epoch {epoch} (best val={best_val_ppl:.1f})")
-                    break
-
-        self.training = False
-        if best_state:
-            self.embeddings = best_state["E"]
-            self.Wq_layers = best_state["Wq"]
-            self.Wk_layers = best_state["Wk"]
-            self.W1_layers = best_state["W1"]
-            self.W2_layers = best_state["W2"]
