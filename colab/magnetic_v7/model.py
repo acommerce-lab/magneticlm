@@ -11,6 +11,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+try:
+    import torch_xla.core.xla_model as xm
+    _HAS_XLA = True
+except ImportError:
+    _HAS_XLA = False
+
 
 # ======================================================================
 # 1. Build spectrum (unchanged)
@@ -138,6 +144,7 @@ class StatTransformer(nn.Module):
                     layer.W2.weight.copy_(embeddings[:d_ff, :].T)
 
     def forward(self, input_ids, pad_mask=None):
+        input_ids = input_ids.long()  # ensure int64 for embedding lookup
         B, S = input_ids.shape
         device = input_ids.device
 
@@ -203,7 +210,7 @@ class LMDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         ctx, tgt = self.pairs[idx]
-        return torch.tensor(ctx, dtype=torch.long), torch.tensor(tgt, dtype=torch.long)
+        return torch.tensor(ctx, dtype=torch.int32), torch.tensor(tgt, dtype=torch.int32)
 
 
 def train_model(model, train_data, val_data, context_len,
@@ -220,12 +227,13 @@ def train_model(model, train_data, val_data, context_len,
         indices = torch.randperm(len(train_ds))[:max_samples].tolist()
         train_ds = torch.utils.data.Subset(train_ds, indices)
 
+    use_cuda = device.type == 'cuda'
     train_loader = torch.utils.data.DataLoader(
         train_ds, batch_size=batch_size, shuffle=True,
-        num_workers=0, pin_memory=True)
+        num_workers=2 if use_cuda else 0, pin_memory=use_cuda)
     val_loader = torch.utils.data.DataLoader(
         val_ds, batch_size=batch_size, shuffle=False,
-        num_workers=0, pin_memory=True)
+        num_workers=2 if use_cuda else 0, pin_memory=use_cuda)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=0.01)
     best_val_ppl = float('inf')
@@ -245,10 +253,13 @@ def train_model(model, train_data, val_data, context_len,
 
             optimizer.zero_grad()
             logits = model(ctx_batch, pad_mask)
-            loss = F.cross_entropy(logits, tgt_batch)
+            loss = F.cross_entropy(logits, tgt_batch.long())
             loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
+            if _HAS_XLA:
+                xm.optimizer_step(optimizer)
+            else:
+                optimizer.step()
+            total_loss += loss.detach().cpu().item()
             n_batches += 1
 
         train_ppl = math.exp(total_loss / max(n_batches, 1))
@@ -262,7 +273,7 @@ def train_model(model, train_data, val_data, context_len,
                 tgt_batch = tgt_batch.to(device)
                 pad_mask = ctx_batch > 0
                 logits = model(ctx_batch, pad_mask)
-                val_loss += F.cross_entropy(logits, tgt_batch).item() * ctx_batch.shape[0]
+                val_loss += F.cross_entropy(logits, tgt_batch.long()).detach().cpu().item() * ctx_batch.shape[0]
                 val_n += ctx_batch.shape[0]
             val_ppl = math.exp(val_loss / max(val_n, 1))
 
