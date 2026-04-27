@@ -264,13 +264,19 @@ def run_pipeline(cfg: Config) -> Dict:
         print("  [eval] OOD cloze...")
         results["ood"] = eval_ood(transformer, V, vocab, cfg, res.primary_device)
 
-    if "StatTransformer" in results.get("layers", {}):
-        ppl_actual = results["layers"]["StatTransformer"]["ppl"]
+    layers = results.get("layers", {})
+    if layers:
+        ppl_pure = layers.get("StatTransformer", {}).get("ppl", float('inf'))
+        ppl_cache = layers.get("StatTransformer+Cache", {}).get("ppl", float('inf'))
+        ppl_actual = min(ppl_pure, ppl_cache)
+        best_name = "StatTransformer+Cache" if ppl_cache < ppl_pure else "StatTransformer"
         efficiency = ppl_bound / ppl_actual if ppl_actual > 0 else 0
         print(f"  ── Knowledge Report ──")
-        print(f"  PPL bound (theoretical) = {ppl_bound:.1f}")
-        print(f"  PPL actual (model)      = {ppl_actual:.1f}")
-        print(f"  Efficiency              = {efficiency:.6f} ({efficiency*100:.4f}%)")
+        print(f"  PPL bound (theoretical)  = {ppl_bound:.1f}")
+        print(f"  PPL pure                 = {ppl_pure:.1f}")
+        print(f"  PPL +cache               = {ppl_cache:.1f}")
+        print(f"  Best ({best_name:20s}) = {ppl_actual:.1f}")
+        print(f"  Efficiency               = {efficiency:.4f} ({efficiency*100:.2f}%)")
         results["efficiency"] = efficiency
 
     print(f"  Total eval: {time.time()-t_eval:.1f}s")

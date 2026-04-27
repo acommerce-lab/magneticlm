@@ -248,13 +248,18 @@ class StatTransformer:
             if ppl < best_ppl:
                 best_ppl = ppl
                 no_improve = 0
+                # Save best weights
+                best_E = E_param.detach().clone()
+                best_Wq = [w.detach().clone() for w in Wq_params]
+                best_Wk = [w.detach().clone() for w in Wk_params]
             else:
                 no_improve += 1
                 if no_improve >= patience:
-                    print(f"    early stop at epoch {epoch} (no improvement for {patience})")
+                    print(f"    early stop at epoch {epoch} (best PPL={best_ppl:.1f})")
                     break
 
-        self.embeddings = E_param.detach()
-        self.Wq_layers = [w.detach() for w in Wq_params]
-        self.Wk_layers = [w.detach() for w in Wk_params]
+        # Restore best weights
+        self.embeddings = best_E if 'best_E' in dir() else E_param.detach()
+        self.Wq_layers = best_Wq if 'best_Wq' in dir() else [w.detach() for w in Wq_params]
+        self.Wk_layers = best_Wk if 'best_Wk' in dir() else [w.detach() for w in Wk_params]
         self.E_norm = self.embeddings / self.embeddings.norm(dim=1, keepdim=True).clamp(min=1e-9)
