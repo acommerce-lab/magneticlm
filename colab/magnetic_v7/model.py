@@ -191,7 +191,7 @@ class StatTransformer:
     def score_single(self, context_ids):
         return self.score_batch([context_ids])[0]
 
-    def refine(self, enc_train, enc_valid, lr=0.001, batch_size=64,
+    def refine(self, enc_train, enc_valid, lr=0.001, batch_size=512,
                max_epochs=100, patience=5):
         """Train ALL weights with validation-based early stopping."""
         E_p = self.embeddings.clone().detach().requires_grad_(True)
@@ -202,52 +202,79 @@ class StatTransformer:
         all_params = [E_p] + Wq_p + Wk_p + W1_p + W2_p
         optimizer = torch.optim.Adam(all_params, lr=lr, weight_decay=0.01)
 
-        # Training data
-        train_ctx, train_tgt = [], []
-        for arr in enc_train:
-            if arr.size < 2:
-                continue
-            ids = arr.astype(np.int64)
-            for i in range(len(ids) - 1):
-                ctx = ids[max(0, i - self.context_len):i + 1].tolist()
-                train_ctx.append(ctx)
-                train_tgt.append(int(ids[i + 1]))
+        # Pre-tensorize training data on GPU
+        cl = self.context_len
+        def _build_pairs(encoded, max_samples=0):
+            all_ids = []
+            for arr in encoded:
+                if arr.size < 2:
+                    continue
+                all_ids.append(arr.astype(np.int64))
+            if not all_ids:
+                return None, None
+            flat = np.concatenate(all_ids)
+            n = len(flat) - 1
+            if max_samples > 0:
+                n = min(n, max_samples)
+            # Build padded context tensor [n, cl+1] and target [n]
+            ctx_t = torch.zeros(n, cl + 1, dtype=torch.long, device=self.device)
+            tgt_t = torch.zeros(n, dtype=torch.long, device=self.device)
+            for i in range(n):
+                start = max(0, i - cl)
+                ctx = flat[start:i + 1]
+                ctx_t[i, cl + 1 - len(ctx):] = torch.tensor(ctx, dtype=torch.long)
+                tgt_t[i] = int(flat[i + 1])
+            return ctx_t, tgt_t
 
-        # Validation data (for early stopping)
-        val_ctx, val_tgt = [], []
-        for arr in enc_valid:
-            if arr.size < 2:
-                continue
-            ids = arr.astype(np.int64)
-            for i in range(min(len(ids) - 1, 5000)):
-                ctx = ids[max(0, i - self.context_len):i + 1].tolist()
-                val_ctx.append(ctx)
-                val_tgt.append(int(ids[i + 1]))
+        print(f"    preparing data on {self.device}...")
+        train_ctx_t, train_tgt_t = _build_pairs(enc_train)
+        val_ctx_t, val_tgt_t = _build_pairs(enc_valid, max_samples=5000)
 
-        n_train = len(train_ctx)
-        n_val = len(val_ctx)
-        if n_train == 0:
+        if train_ctx_t is None:
             return
+        n_train = train_ctx_t.shape[0]
+        n_val = val_ctx_t.shape[0] if val_ctx_t is not None else 0
         self.training = True
-        indices = list(range(n_train))
         best_val_ppl = float('inf')
         no_improve = 0
         best_state = None
+        print(f"    train={n_train:,} val={n_val:,} samples, batch={batch_size}")
+
+        def _forward_tensor(ctx_padded, E, Wq_list, Wk_list, W1_list, W2_list):
+            """Forward on pre-padded tensor [batch, cl+1]."""
+            pad_mask = ctx_padded > 0  # 0 = padding
+            x = E[ctx_padded]
+            S = x.shape[1]
+            pos = torch.arange(S, dtype=torch.float32, device=self.device)
+            pw = torch.exp(-self.pos_decay * (S - 1 - pos))
+            x = x * pw.unsqueeze(0).unsqueeze(-1) * pad_mask.unsqueeze(-1).float()
+            causal = torch.tril(torch.ones(S, S, device=self.device, dtype=torch.bool))
+            p_mask = pad_mask.unsqueeze(1)
+            for l in range(self.n_layers):
+                Q = x @ Wq_list[l]
+                K = x @ Wk_list[l]
+                attn_out = self._attention(Q, K, x, causal, p_mask)
+                if self.training:
+                    attn_out = F.dropout(attn_out, p=self.dropout_p)
+                x = _layer_norm(x + attn_out)
+                ffn_h = F.relu(x @ W1_list[l])
+                if self.training:
+                    ffn_h = F.dropout(ffn_h, p=self.dropout_p)
+                x = _layer_norm(x + ffn_h @ W2_list[l])
+            return x[:, -1, :] @ E.T / math.sqrt(self.d)
 
         for epoch in range(max_epochs):
-            # Train
-            np.random.shuffle(indices)
+            perm = torch.randperm(n_train, device=self.device)
             total_loss, n_batches = 0.0, 0
 
             for start in range(0, n_train, batch_size):
                 end = min(start + batch_size, n_train)
-                batch_idx = indices[start:end]
-                batch_ctx = [train_ctx[i] for i in batch_idx]
-                batch_tgt = torch.tensor([train_tgt[i] for i in batch_idx],
-                                         dtype=torch.long, device=self.device)
+                idx = perm[start:end]
+                batch_ctx = train_ctx_t[idx]
+                batch_tgt = train_tgt_t[idx]
 
                 optimizer.zero_grad()
-                logits = self._forward_logits(batch_ctx, E_p, Wq_p, Wk_p, W1_p, W2_p)
+                logits = _forward_tensor(batch_ctx, E_p, Wq_p, Wk_p, W1_p, W2_p)
                 loss = F.cross_entropy(logits, batch_tgt)
                 loss.backward()
                 optimizer.step()
@@ -262,10 +289,9 @@ class StatTransformer:
                 val_loss = 0.0
                 for vs in range(0, n_val, batch_size):
                     ve = min(vs + batch_size, n_val)
-                    vctx = val_ctx[vs:ve]
-                    vtgt = torch.tensor(val_tgt[vs:ve], dtype=torch.long, device=self.device)
-                    vlogits = self._forward_logits(vctx, E_p, Wq_p, Wk_p, W1_p, W2_p)
-                    val_loss += F.cross_entropy(vlogits, vtgt).item() * (ve - vs)
+                    vlogits = _forward_tensor(
+                        val_ctx_t[vs:ve], E_p, Wq_p, Wk_p, W1_p, W2_p)
+                    val_loss += F.cross_entropy(vlogits, val_tgt_t[vs:ve]).item() * (ve - vs)
                 val_ppl = math.exp(val_loss / max(n_val, 1))
             self.training = True
 
