@@ -166,15 +166,7 @@ def run_pipeline(cfg: Config) -> Dict:
     H = knowledge["H_conditional"]
     H_max = knowledge["H_max"]
 
-    # n_layers scales with coverage (more data = more layers benefit)
-    coverage_factor = min(4, max(1, int(math.log2(coverage + 1))))
-    if H > 0.1:
-        n_layers = max(2, min(6, math.ceil(math.log2(H_max / H)) + coverage_factor - 1))
-    else:
-        n_layers = 2
-
     print(f"  H(next|prev) = {H:.2f} bits")
-    print(f"  H_max = log2({V}) = {H_max:.2f} bits")
     print(f"  Knowledge K = {K:.4f} ({K*100:.1f}%)")
     print(f"  PPL bound = {ppl_bound:.1f}")
     N = knowledge["N"]
@@ -185,7 +177,13 @@ def run_pipeline(cfg: Config) -> Dict:
         print(f"  ⚠ INSUFFICIENT DATA: need {cover_threshold:,.0f} tokens, have {N:,}")
     else:
         print(f"  ✓ Data sufficient for stable spectral extraction")
-    print(f"  Layers L = ceil(log2({H_max:.1f}/{H:.1f})) = {n_layers}")
+    # n_layers scales with coverage
+    coverage_factor = min(4, max(1, int(math.log2(coverage + 1))))
+    if H > 0.1:
+        n_layers = max(2, min(6, math.ceil(math.log2(H_max / H)) + coverage_factor - 1))
+    else:
+        n_layers = 2
+    print(f"  Layers L = {n_layers}")
     print(f"  ({time.time()-t0:.1f}s)")
     print("-" * 72)
 
