@@ -247,7 +247,108 @@ def train_model(model, train_data, val_data, context_len,
 
 
 # ======================================================================
-# 5. Cache helper
+# 5. Statistical Training (on transition matrix, not raw data)
+# ======================================================================
+
+def train_statistical(model, bigram_trans, V, context_len,
+                      enc_valid=None, lr=0.001, max_epochs=100, patience=5):
+    """Train by matching the bigram transition matrix directly.
+
+    Instead of millions of raw samples, we train on V rows of T[w,:].
+    Each row = the ideal P(next|prev=w). Model learns to reproduce this.
+    Much faster: V iterations per epoch instead of N.
+    """
+    device = next(model.parameters()).device
+
+    # Build dense transition matrix on device
+    T_dense = bigram_trans.to_dense().to(device)  # [V, V]
+    # Add small uniform floor to avoid zero targets
+    T_dense = T_dense + 1e-6
+    T_dense = T_dense / T_dense.sum(dim=1, keepdim=True)
+
+    # Validation data (for early stopping)
+    val_ctx, val_tgt = None, None
+    if enc_valid:
+        vds = LMDataset(enc_valid, context_len, 10000)
+        val_loader = torch.utils.data.DataLoader(vds, batch_size=512, shuffle=False)
+
+    # Multi-GPU
+    gpu_count = torch.cuda.device_count() if device.type == 'cuda' else 0
+    if gpu_count > 1:
+        model = torch.nn.DataParallel(model)
+        print(f"    DataParallel: {gpu_count} GPUs")
+
+    raw_model = model.module if hasattr(model, 'module') else model
+    optimizer = torch.optim.Adam(raw_model.parameters(), lr=lr, weight_decay=0.01)
+    best_val, no_improve, best_state = float('inf'), 0, None
+    batch_size = min(V, 512)
+
+    print(f"    Statistical training: V={V} words, batch={batch_size}")
+
+    for epoch in range(max_epochs):
+        t0 = time.time()
+        model.train()
+        perm = torch.randperm(V, device=device)
+        total_loss, n_batches = 0.0, 0
+
+        for start in range(0, V, batch_size):
+            end = min(start + batch_size, V)
+            word_ids = perm[start:end]  # [batch]
+
+            # Context = just the single word (bigram prediction)
+            ctx = word_ids.unsqueeze(1).long()  # [batch, 1]
+            pad_mask = torch.ones_like(ctx, dtype=torch.bool)
+
+            optimizer.zero_grad()
+            logits = model(ctx, pad_mask)  # [batch, V]
+            log_probs = F.log_softmax(logits, dim=1)
+
+            # KL divergence: target = T[word_id, :]
+            target_dist = T_dense[word_ids]  # [batch, V]
+            loss = F.kl_div(log_probs, target_dist, reduction='batchmean')
+
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.detach().cpu().item()
+            n_batches += 1
+
+        train_loss = total_loss / max(n_batches, 1)
+        elapsed = time.time() - t0
+
+        # Validation PPL on real data
+        val_ppl = float('inf')
+        if enc_valid:
+            model.eval()
+            with torch.no_grad():
+                vl, vn = 0.0, 0
+                for ctx_b, tgt_b in val_loader:
+                    ctx_b, tgt_b = ctx_b.to(device), tgt_b.to(device)
+                    logits = model(ctx_b, ctx_b > 0)
+                    vl += F.cross_entropy(logits, tgt_b.long()).detach().cpu().item() * ctx_b.shape[0]
+                    vn += ctx_b.shape[0]
+                val_ppl = math.exp(vl / max(vn, 1))
+
+        tag = "↓" if val_ppl < best_val else "↑"
+        print(f"    epoch {epoch}: KL={train_loss:.4f} val_PPL={val_ppl:.1f} {tag} ({elapsed:.1f}s)")
+
+        if val_ppl < best_val:
+            best_val, no_improve = val_ppl, 0
+            raw = model.module if hasattr(model, 'module') else model
+            best_state = {k: v.cpu().clone() for k, v in raw.state_dict().items()}
+        else:
+            no_improve += 1
+            if no_improve >= patience:
+                print(f"    early stop epoch {epoch} (best val={best_val:.1f})")
+                break
+
+    if best_state:
+        raw = model.module if hasattr(model, 'module') else model
+        raw.load_state_dict({k: v.to(device) for k, v in best_state.items()})
+    return model
+
+
+# ======================================================================
+# 6. Cache helper
 # ======================================================================
 
 def decay_cache(history, V, device):

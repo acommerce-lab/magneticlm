@@ -5,7 +5,7 @@ import numpy as np, torch
 
 from .config import Config
 from .data import load_dataset
-from .model import build_spectrum, StatTransformer, train_model
+from .model import build_spectrum, StatTransformer, train_model, train_statistical
 from .evaluator import eval_layers, eval_ood
 from .resources import Monitor, detect, setup_cuda_tuning
 from .stats import build_stats
@@ -135,10 +135,17 @@ def run_pipeline(cfg: Config) -> Dict:
             stats.unigram_counts, bg_trans, V, cfg.min_ppmi, cfg.var_target)
         os.makedirs(cfg.cache_dir, exist_ok=True)
         torch.save({"embeddings": embeddings, "Wq": Wq, "Wk": Wk,
-                     "d": d, "n_heads": n_heads}, os.path.join(cfg.cache_dir, f"spectrum_{key}.pt"))
+                     "d": d, "n_heads": n_heads, "bg_trans": bg_trans},
+                    os.path.join(cfg.cache_dir, f"spectrum_{key}.pt"))
         print(f"  spectrum in {time.time()-t0:.1f}s")
-        del stats, bg_trans; gc.collect()
+        del stats; gc.collect()
     mon.snapshot("after-spectrum")
+
+    # Build bigram trans if not from cache
+    if 'bg_trans' not in dir() and cached and "bg_trans" in cached:
+        bg_trans = cached["bg_trans"]
+    elif 'bg_trans' not in dir():
+        bg_trans = _build_bigram_trans(enc_train, V, torch.device("cpu"))
 
     # Model
     device = res.primary_device
@@ -147,10 +154,18 @@ def run_pipeline(cfg: Config) -> Dict:
     model = model.to(device)
 
     if cfg.refine:
-        print(f"Refining (L={n_layers})...")
+        # Phase 1: Statistical training (fast, on transition matrix)
+        print(f"Phase 1: Statistical training on T[{V}x{V}]...")
         t0 = time.time()
-        model = train_model(model, enc_train, enc_valid, cfg.context_len)
-        print(f"  refined in {time.time()-t0:.1f}s")
+        model = train_statistical(model, bg_trans, V, cfg.context_len, enc_valid)
+        print(f"  statistical training in {time.time()-t0:.1f}s")
+
+        # Phase 2: Fine-tune on raw data (slower, captures context)
+        print(f"Phase 2: Fine-tuning on raw data...")
+        t0 = time.time()
+        model = train_model(model, enc_train, enc_valid, cfg.context_len,
+                            max_epochs=30, patience=3)
+        print(f"  fine-tuned in {time.time()-t0:.1f}s")
 
     # Unwrap DataParallel for eval
     eval_model = model.module if hasattr(model, 'module') else model
