@@ -174,26 +174,31 @@ class LMDataset(torch.utils.data.Dataset):
 
 def train_model(model, train_data, val_data, context_len,
                 lr=0.001, batch_size=512, max_epochs=100, patience=5,
-                max_train=50000, max_val=10000):
-    """Train with automatic device distribution via Accelerate if available."""
+                max_train=0, max_val=10000):
+    """Train with DataParallel for multi-GPU. No subsample on train by default."""
     train_ds = LMDataset(train_data, context_len, max_train)
     val_ds = LMDataset(val_data, context_len, max_val)
-    train_loader = torch.utils.data.DataLoader(train_ds, batch_size=batch_size, shuffle=True)
-    val_loader = torch.utils.data.DataLoader(val_ds, batch_size=batch_size, shuffle=False)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=0.01)
+    device = next(model.parameters()).device
+    use_cuda = device.type == 'cuda'
+    nw = 2 if use_cuda else 0
 
-    # Try Accelerate for multi-device
-    try:
-        from accelerate import Accelerator
-        accelerator = Accelerator()
-        model, optimizer, train_loader, val_loader = accelerator.prepare(
-            model, optimizer, train_loader, val_loader)
-        device = accelerator.device
-        print(f"    Accelerate: {accelerator.num_processes} processes, device={device}")
-    except ImportError:
-        device = next(model.parameters()).device
-        print(f"    No Accelerate, using {device}")
-        accelerator = None
+    # Multi-GPU via DataParallel (splits batch across GPUs)
+    gpu_count = torch.cuda.device_count() if use_cuda else 0
+    if gpu_count > 1:
+        model = torch.nn.DataParallel(model)
+        batch_size = batch_size * gpu_count  # scale batch with GPUs
+        print(f"    DataParallel: {gpu_count} GPUs, batch={batch_size}")
+    else:
+        print(f"    device={device}")
+
+    train_loader = torch.utils.data.DataLoader(
+        train_ds, batch_size=batch_size, shuffle=True,
+        num_workers=nw, pin_memory=use_cuda)
+    val_loader = torch.utils.data.DataLoader(
+        val_ds, batch_size=batch_size, shuffle=False,
+        num_workers=nw, pin_memory=use_cuda)
+    raw_model = model.module if hasattr(model, 'module') else model
+    optimizer = torch.optim.Adam(raw_model.parameters(), lr=lr, weight_decay=0.01)
 
     print(f"    train={len(train_ds):,} val={len(val_ds):,} batch={batch_size}")
     best_val, no_improve, best_state = float('inf'), 0, None
@@ -206,10 +211,7 @@ def train_model(model, train_data, val_data, context_len,
             optimizer.zero_grad()
             logits = model(ctx_b, ctx_b > 0)
             loss = F.cross_entropy(logits, tgt_b.long())
-            if accelerator:
-                accelerator.backward(loss)
-            else:
-                loss.backward()
+            loss.backward()
             optimizer.step()
             total_loss += loss.detach().cpu().item()
             n_batches += 1
@@ -230,7 +232,7 @@ def train_model(model, train_data, val_data, context_len,
 
         if val_ppl < best_val:
             best_val, no_improve = val_ppl, 0
-            raw = accelerator.unwrap_model(model) if accelerator else model
+            raw = model.module if hasattr(model, 'module') else model
             best_state = {k: v.cpu().clone() for k, v in raw.state_dict().items()}
         else:
             no_improve += 1
@@ -239,7 +241,7 @@ def train_model(model, train_data, val_data, context_len,
                 break
 
     if best_state:
-        raw = accelerator.unwrap_model(model) if accelerator else model
+        raw = model.module if hasattr(model, 'module') else model
         raw.load_state_dict({k: v.to(device) for k, v in best_state.items()})
     return model
 

@@ -152,15 +152,17 @@ def run_pipeline(cfg: Config) -> Dict:
         model = train_model(model, enc_train, enc_valid, cfg.context_len)
         print(f"  refined in {time.time()-t0:.1f}s")
 
-    model.eval()
+    # Unwrap DataParallel for eval
+    eval_model = model.module if hasattr(model, 'module') else model
+    eval_model.eval()
 
     # Eval
     print("Evaluating...")
     t_eval = time.time()
     results = {"knowledge": knowledge, "d": d, "n_layers": n_layers, "ppl_bound": ppl_bound, "coverage": coverage}
-    results["layers"] = eval_layers(model, V, enc_valid, cfg, device)
+    results["layers"] = eval_layers(eval_model, V, enc_valid, cfg, device)
     if cfg.eval_ood_cloze:
-        results["ood"] = eval_ood(model, V, vocab, cfg, device)
+        results["ood"] = eval_ood(eval_model, V, vocab, cfg, device)
 
     layers = results.get("layers", {})
     if layers:
