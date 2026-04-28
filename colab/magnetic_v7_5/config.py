@@ -19,7 +19,7 @@ class Config:
     var_target: float = 0.3
     refine: bool = False
     min_ppmi: float = 0.5
-    context_len: int = 8
+    context_len: int = 32
     pos_decay: float = 0.1
     eval_ppl: bool = True
     eval_ood_cloze: bool = True

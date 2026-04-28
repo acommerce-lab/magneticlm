@@ -42,36 +42,30 @@ def build_spectrum(ctx_rows, ctx_cols, ctx_counts, unigram,
     print(f"    cumvar: {cumvar[d-1]:.1%} at d={d}")
     embeddings = U_full[:, :d] * S_full[:d].sqrt().unsqueeze(0)
 
-    # Build multiple relation matrices in embedding space
+    # Build multiple relation matrices — normalize each independently
     TE = torch.sparse.mm(bg_trans.cpu(), embeddings)
-    M_fwd = embeddings.T @ TE                    # forward transitions
-    M_sim = embeddings.T @ embeddings             # distributional similarity
-    TE_bwd = torch.sparse.mm(bg_trans.t().cpu(), embeddings)
-    M_bwd = embeddings.T @ TE_bwd                # backward transitions
+    M_fwd = embeddings.T @ TE
+    M_fwd = M_fwd / M_fwd.norm().clamp(min=1e-9)
 
-    # Combine and decompose → each singular vector = one attention head
+    M_sim = embeddings.T @ embeddings
+    M_sim = M_sim / M_sim.norm().clamp(min=1e-9)
+
+    TE_bwd = torch.sparse.mm(bg_trans.t().cpu(), embeddings)
+    M_bwd = embeddings.T @ TE_bwd
+    M_bwd = M_bwd / M_bwd.norm().clamp(min=1e-9)
+
+    # Equal-weight combination (each matrix contributes equally)
     M_total = M_fwd + M_sim + M_bwd
-    # Normalize
-    M_total = M_total / M_total.norm().clamp(min=1e-9)
     U_m, S_m, Vh_m = torch.linalg.svd(M_total)
 
-    # Auto n_heads from cumulative variance of M_total spectrum
-    S_sq = S_m ** 2
-    cumvar = torch.cumsum(S_sq, dim=0) / S_sq.sum().clamp(min=1e-9)
-    n_heads_raw = int((cumvar < 0.9).sum().item()) + 1
-    # Find nearest divisor of d
+    # n_heads: find best divisor of d, minimum 2
     n_heads = 1
-    for h in range(min(n_heads_raw, d), 0, -1):
-        if d % h == 0:
+    for h in [2, 3, 4, 6, 7, 8, 12, 16, d]:
+        if d % h == 0 and h <= d // 2:
             n_heads = h
-            break
-    n_heads = max(1, min(n_heads, d // 2))
-    # Fallback: if only 1 head, use at least 2 (or best small divisor)
-    if n_heads == 1 and d >= 4:
+    if n_heads < 2 and d >= 4:
         for h in [2, 3, 4, 6, 7, 8]:
-            if d % h == 0:
-                n_heads = h
-                break
+            if d % h == 0: n_heads = h; break
 
     # Build Wq/Wk: each head gets sqrt(S) weighting for its spectral direction
     # But normalize so attention scale is controlled
@@ -80,7 +74,7 @@ def build_spectrum(ctx_rows, ctx_cols, ctx_counts, unigram,
     Wq_init = (U_m * S_head.sqrt().unsqueeze(0)).contiguous()
     Wk_init = (Vh_m.T * S_head.sqrt().unsqueeze(0)).contiguous()
 
-    print(f"    d={d}, n_heads={n_heads} (from {n_heads_raw} spectral), built in {time.time()-t0:.1f}s")
+    print(f"    d={d}, n_heads={n_heads}, d_head={d//n_heads}, built in {time.time()-t0:.1f}s")
     return embeddings, Wq_init, Wk_init, d, n_heads
 
 
