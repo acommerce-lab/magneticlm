@@ -154,18 +154,18 @@ def run_pipeline(cfg: Config) -> Dict:
     model = model.to(device)
 
     if cfg.refine:
-        # Phase 1: Statistical training (fast, on transition matrix)
-        print(f"Phase 1: Statistical training on T[{V}x{V}]...")
+        # Phase 1: Statistical training (fast, learns bigram patterns)
+        print(f"Phase 1: Statistical training...")
         t0 = time.time()
         model = train_statistical(model, bg_trans, V, cfg.context_len, enc_valid)
-        print(f"  statistical training in {time.time()-t0:.1f}s")
+        print(f"  done in {time.time()-t0:.1f}s")
 
-        # Phase 2: Fine-tune on raw data (slower, captures context)
+        # Phase 2: Fine-tune on raw data (learns multi-word context)
         print(f"Phase 2: Fine-tuning on raw data...")
         t0 = time.time()
         model = train_model(model, enc_train, enc_valid, cfg.context_len,
                             max_epochs=30, patience=3)
-        print(f"  fine-tuned in {time.time()-t0:.1f}s")
+        print(f"  done in {time.time()-t0:.1f}s")
 
     # Unwrap DataParallel for eval
     eval_model = model.module if hasattr(model, 'module') else model
